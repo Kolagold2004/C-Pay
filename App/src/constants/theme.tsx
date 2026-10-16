@@ -235,7 +235,7 @@ export const ThemeProvider: React.FC<React.PropsWithChildren> = ({ children }) =
     () => ({ colorScheme, colors, isDark: colorScheme === 'dark' }),
     [colorScheme, colors],
   );
-  return React.createElement(ThemeContext.Provider, { value }, children);
+  return <ThemeContext.Provider value={value}>{children}</ThemeContext.Provider>;
 };
 
 export const useTheme = () => useContext(ThemeContext);
