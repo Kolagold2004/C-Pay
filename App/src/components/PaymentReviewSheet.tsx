@@ -10,8 +10,7 @@ import {
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { COLORS, SPACING, FONT_SIZES, BORDER_RADIUS, createThemedStyles, useTheme } from '../constants/theme';
-import { BLOCKCHAIN_CONFIG, createThemedStyles, useTheme } from '../constants/theme';
+import { BLOCKCHAIN_CONFIG, COLORS, SPACING, FONT_SIZES, BORDER_RADIUS, createThemedStyles, useTheme } from '../constants/theme';
 import { formatMoneyAmount } from '../utils/currency';
 import { PILOT_NOTICE_TEXT } from '../utils/pilot';
 import { Button } from './Button';
