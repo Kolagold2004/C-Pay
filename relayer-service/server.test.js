@@ -99,6 +99,15 @@ function buildFetchMock({
     if (urlStr.includes('/rest/v1/wallet_bindings')) {
       const parsed = new URL(urlStr);
       const method = (options && options.method) || 'GET';
+      if (method === 'POST') {
+        if (failBindingWrite) {
+          return makeResponse(false, 503, { code: 'PGRST000', message: 'database unavailable' });
+        }
+        const binding = JSON.parse(options.body);
+        const wallets = userWallets[binding.auth_user_id] || (userWallets[binding.auth_user_id] = []);
+        if (!wallets.includes(binding.wallet_address)) wallets.push(binding.wallet_address);
+        return makeResponse(true, 201, null);
+      }
       const authUserIdFilter = parsed.searchParams.get('auth_user_id') || '';
       if (authUserIdFilter) {
         const uid = authUserIdFilter.replace(/^eq\./, '');
@@ -321,6 +330,9 @@ let activeIngestWorker = null;
 // ─── request helper ──────────────────────────────────────────────────────────
 
 const http = require('http');
+const StellarSdk = require('@stellar/stellar-sdk');
+
+const TEST_SPONSOR_SECRET = 'SCTIPFZ5KVBOENXTZK3FQPIGR5H73R5HE2MNZ4AXA7CA7JEEXUG5AF5G';
 
 function postJson(appInstance, path, body, headers = {}) {
   return new Promise((resolve, reject) => {
@@ -487,6 +499,107 @@ describe('/accounts/prepare ownership', () => {
 });
 
 // ── /add-money ───────────────────────────────────────────────────────────────
+
+async function loadAccountSubmissionServer(userWallets) {
+  const mod = await loadServerModule({
+    __fetchMock: buildFetchMock({ userWallets }),
+  });
+  const sponsorKeypair = StellarSdk.Keypair.fromSecret(TEST_SPONSOR_SECRET);
+  const sponsorAccount = new StellarSdk.Account(sponsorKeypair.publicKey(), '1');
+  sponsorAccount.balances = [{ asset_type: 'native', balance: '1000' }];
+
+  mod.testHooks.stellarServer.loadAccount = async (accountId) => {
+    if (accountId === sponsorKeypair.publicKey()) return sponsorAccount;
+    const error = new Error('Account not found');
+    error.response = { status: 404 };
+    throw error;
+  };
+  mod.testHooks.stellarServer.submitTransaction = async (transaction) => ({
+    hash: transaction.hash().toString('hex'),
+    ledger: 1,
+  });
+  return mod;
+}
+
+describe('/accounts/submit prepared setup authorization', () => {
+  const passphrase = 'Test SDF Network ; September 2015';
+
+  it('allows an authenticated new wallet to prepare, sign, and submit its setup transaction', async () => {
+    const newWallet = StellarSdk.Keypair.random();
+    const mod = await loadAccountSubmissionServer({ [USER_B]: [WALLET_B] });
+    const prepare = await postJson(
+      mod.app,
+      '/accounts/prepare',
+      { accountId: newWallet.publicKey() },
+      { Authorization: makeBearerToken(USER_A) }
+    );
+
+    expect(prepare.status).toBe(200);
+    expect(prepare.body.alreadyReady).toBe(false);
+    const signedTransaction = StellarSdk.TransactionBuilder.fromXDR(prepare.body.xdr, passphrase);
+    signedTransaction.sign(newWallet);
+
+    const submit = await postJson(
+      mod.app,
+      '/accounts/submit',
+      { signedXdr: signedTransaction.toXDR() },
+      { Authorization: makeBearerToken(USER_A) }
+    );
+
+    expect(submit.status).toBe(200);
+    expect(submit.body.status).toBe('success');
+  });
+
+  it('rejects a prepared setup transaction when another authenticated user submits it', async () => {
+    const newWallet = StellarSdk.Keypair.random();
+    const mod = await loadAccountSubmissionServer({ [USER_B]: [WALLET_B] });
+    const prepare = await postJson(
+      mod.app,
+      '/accounts/prepare',
+      { accountId: newWallet.publicKey() },
+      { Authorization: makeBearerToken(USER_A) }
+    );
+    const signedTransaction = StellarSdk.TransactionBuilder.fromXDR(prepare.body.xdr, passphrase);
+    signedTransaction.sign(newWallet);
+
+    const submit = await postJson(
+      mod.app,
+      '/accounts/submit',
+      { signedXdr: signedTransaction.toXDR() },
+      { Authorization: makeBearerToken(USER_B) }
+    );
+
+    expect(submit.status).toBe(403);
+    expect(submit.body.code).toBe('WALLET_OWNERSHIP_DENIED');
+  });
+
+  it('rejects an arbitrary transaction even when its source wallet belongs to the user', async () => {
+    const wallet = StellarSdk.Keypair.random();
+    const mod = await loadAccountSubmissionServer({ [USER_A]: [wallet.publicKey()] });
+    const arbitraryTransaction = new StellarSdk.TransactionBuilder(
+      new StellarSdk.Account(wallet.publicKey(), '1'),
+      { fee: StellarSdk.BASE_FEE, networkPassphrase: passphrase }
+    )
+      .addOperation(StellarSdk.Operation.payment({
+        destination: WALLET_B,
+        asset: StellarSdk.Asset.native(),
+        amount: '1',
+      }))
+      .setTimeout(60)
+      .build();
+    arbitraryTransaction.sign(wallet);
+
+    const submit = await postJson(
+      mod.app,
+      '/accounts/submit',
+      { signedXdr: arbitraryTransaction.toXDR() },
+      { Authorization: makeBearerToken(USER_A) }
+    );
+
+    expect(submit.status).toBe(403);
+    expect(submit.body.code).toBe('WALLET_OWNERSHIP_DENIED');
+  });
+});
 
 describe('/add-money ownership', () => {
   let expressApp;
