@@ -1,5 +1,5 @@
 import { Logger } from '../utils/logger';
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect } from 'react';
 
 // Send money screen: user-driven transfer flow and recipient validation.
 import {
@@ -8,13 +8,11 @@ import {
   StyleSheet,
   TouchableOpacity,
   Platform,
-  BackHandler,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { Ionicons } from '@expo/vector-icons';
 import { getBalance, isValidAccountId } from '../services/blockchain';
-import { getUserDisplayName } from '../services/storage';
-import { formatWalletFingerprint, getCPayIdByWallet, isValidCPayId, getWalletAddressFromCPayId } from '../utils/cpayId';
+import { formatWalletFingerprint } from '../utils/cpayId';
 import { COLORS, SPACING, FONT_SIZES, BORDER_RADIUS, SHADOWS, createThemedStyles, useTheme } from '../constants/theme';
 import {
   Button,
@@ -52,11 +50,9 @@ export const SendMoneyScreen: React.FC<SendMoneyScreenProps> = ({ navigation, ro
   const [showReview, setShowReview] = useState<boolean>(false);
 
   const {
-    idempotencyKey,
     createIntent,
     getOrCreateIntent,
     clearIntent,
-    resetIntent,
   } = usePaymentIntent(route?.params?.idempotencyKey || null);
 
   const {
@@ -74,6 +70,22 @@ export const SendMoneyScreen: React.FC<SendMoneyScreenProps> = ({ navigation, ro
     handleAddressChange,
     resetRecipient,
   } = useRecipientLookup(walletAddress, isFromQR);
+
+  const {
+    submitting,
+    paymentInProgress,
+    executePayment,
+  } = usePaymentSubmission({
+    navigation,
+    amount,
+    recipientAddress,
+    recipientName,
+    recipientCPayId,
+    walletAddress,
+    note,
+    getOrCreateIntent,
+    clearIntent,
+  });
 
   useEffect(() => {
     loadWalletData();
@@ -136,108 +148,6 @@ export const SendMoneyScreen: React.FC<SendMoneyScreenProps> = ({ navigation, ro
     }
   };
 
-  // Fetch recipient name when address is entered
-  const fetchRecipientName = async (
-    address: string,
-    options: {
-      fallbackName?: string;
-    } = {}
-  ) => {
-    const lookupSeq = ++recipientLookupSeq.current;
-    const fallbackName = options.fallbackName?.trim() || '';
-
-    if (!address || !isValidAccountId(address)) {
-      setRecipientName('');
-      setRecipientCPayId('');
-      setRecipientFetched(false);
-      return;
-    }
-
-    // Don't fetch if same as user's wallet
-    if (address === walletAddress) {
-      setRecipientName('');
-      setRecipientCPayId('');
-      setRecipientFetched(false);
-      return;
-    }
-
-    setFetchingRecipient(true);
-    try {
-      const [name, cpayId] = await Promise.all([
-        getUserDisplayName(address),
-        getCPayIdByWallet(address),
-      ]);
-
-      if (lookupSeq !== recipientLookupSeq.current) {
-        return;
-      }
-
-      const displayName = name || fallbackName;
-      if (displayName) {
-        setRecipientName(displayName);
-        setRecipientCPayId(cpayId || formatWalletFingerprint(address));
-        setRecipientFetched(true);
-      } else {
-        setRecipientName('');
-        setRecipientCPayId(formatWalletFingerprint(address));
-        setRecipientFetched(false);
-      }
-    } catch (error) {
-      Logger.info('Error fetching recipient name:', error);
-      setRecipientName('');
-      setRecipientCPayId('');
-      setRecipientFetched(false);
-    } finally {
-      if (lookupSeq === recipientLookupSeq.current) {
-        setFetchingRecipient(false);
-      }
-    }
-  };
-
-  // Handle address input change - auto-fetch when valid address or C-Pay ID is entered
-  const handleAddressChange = async (input: string) => {
-    setRecipientInput(input);
-
-    // Clear previous recipient info when address changes
-    if (!isFromQR) {
-      setRecipientAddress('');
-      setRecipientName('');
-      setRecipientCPayId('');
-      setRecipientFetched(false);
-    }
-
-    // Check if input is a valid C-Pay ID
-    if (!isFromQR && isValidCPayId(input.trim())) {
-      setFetchingRecipient(true);
-      try {
-        // Look up wallet address from C-Pay ID
-        const walletAddr = await getWalletAddressFromCPayId(input.trim());
-        if (walletAddr) {
-          setRecipientAddress(walletAddr);
-          // Fetch name and C-Pay ID
-          await fetchRecipientName(walletAddr);
-        } else {
-          setRecipientAddress('');
-          setRecipientName('');
-          setRecipientCPayId('');
-          setRecipientFetched(false);
-        }
-      } catch (error) {
-        Logger.error('Error looking up C-Pay ID:', error);
-      } finally {
-        setFetchingRecipient(false);
-      }
-      return;
-    }
-
-    // Otherwise treat as wallet address
-    setRecipientAddress(input);
-
-    if (!isFromQR && isValidAccountId(input)) {
-      fetchRecipientName(input);
-    }
-  };
-
   const validateInputs = (): boolean => {
     if (!recipientInput.trim() && !recipientAddress.trim()) {
       AlertManager.alert('Invalid C-Pay ID', 'Please enter a recipient C-Pay ID');
@@ -289,148 +199,6 @@ export const SendMoneyScreen: React.FC<SendMoneyScreenProps> = ({ navigation, ro
 
     getOrCreateIntent();
     setShowReview(true);
-  };
-
-  // Executed after the user confirms in the review sheet. Performs wallet
-  // unlock and submits the payment, then routes to the processing/result flow.
-  const executePayment = async () => {
-    if (paymentInProgress.current) return;
-
-    const effectiveRecipientName = recipientName;
-    const effectiveRecipientCPayId = recipientCPayId;
-    const displayId = effectiveRecipientCPayId || formatWalletFingerprint(recipientAddress);
-    const activeIntentKey = getOrCreateIntent();
-
-    const timestamp = () =>
-      new Date().toLocaleString('en-US', {
-        month: 'short',
-        day: 'numeric',
-        year: 'numeric',
-        hour: 'numeric',
-        minute: '2-digit',
-        hour12: true,
-      });
-
-    try {
-      setSubmitting(true);
-      // Close the review sheet BEFORE wallet unlock. The PIN dialog is itself a
-      // modal, and stacking modals fails on iOS — so we dismiss the sheet first
-      // and show the screen's own loading state during authentication/submit.
-      setShowReview(false);
-      paymentInProgress.current = true;
-
-      // Set timeout for slow network detection.
-      networkTimeoutRef.current = setTimeout(() => {
-        if (paymentInProgress.current) {
-          AlertManager.alert(
-            'Slow Network Detected',
-            'Your network connection is slow. The payment is still processing...',
-            [{ text: 'OK' }]
-          );
-        }
-      }, 10000);
-
-      const wallet = await getAuthenticatedWallet(
-        'Confirm Payment',
-        'Enter your 6-digit PIN to send pilot credits',
-        'Unlock wallet to send pilot credits'
-      );
-      if (!wallet) {
-        paymentInProgress.current = false;
-        if (networkTimeoutRef.current) clearTimeout(networkTimeoutRef.current);
-        setSubmitting(false);
-        AlertManager.alert('Authentication Failed', 'Transaction cancelled');
-        return;
-      }
-
-      // Navigate to Processing screen immediately.
-      const startTime = Date.now();
-
-      navigation.replace('PaymentProcessing', {
-        amount: amount,
-        recipientName: effectiveRecipientName || displayId,
-        recipientAddress: recipientAddress.trim(),
-      });
-
-      const txHash = await transferTokens(
-        wallet,
-        recipientAddress.trim(),
-        amount,
-        {
-          note,
-          idempotencyKey: activeIntentKey,
-        }
-      );
-
-      // Clear timeout on success
-      if (networkTimeoutRef.current) clearTimeout(networkTimeoutRef.current);
-      paymentInProgress.current = false;
-
-      // Terminal state: clear payment intent
-      clearIntent();
-
-      // Calculate processing time
-      const processingTime = Math.round((Date.now() - startTime) / 1000);
-
-      // Save transaction locally and sync to Supabase
-      const senderName = await AsyncStorage.getItem('user_name');
-
-      const transactionData = {
-        tx_hash: txHash,
-        to_address: recipientAddress.trim(),
-        from_address: walletAddress,
-        amount: amount,
-        status: 'pending' as const,
-        internal_status: 'submitted' as const,
-        recipient_name: effectiveRecipientName || undefined,
-        sender_name: senderName || undefined,
-        note: note || undefined, // Separate note field
-        created_at: new Date().toISOString(),
-        submitted_at: new Date().toISOString(),
-        transaction_type: 'personal' as const,
-      };
-
-      saveTransaction(transactionData)
-// [SECURITY] Removed sensitive log: .then(() => console.log('✅ Transaction saved and synced'))
-// [SECURITY] Removed sensitive log: .catch(err => console.error('❌ Transaction save/sync error:', err));
-
-      // Navigate to Success screen
-      navigation.replace('PaymentSuccess', {
-        transactionHash: txHash,
-        fromAddress: walletAddress,
-        amount: amount,
-        recipientName: effectiveRecipientName || displayId,
-        recipientAddress: recipientAddress.trim(),
-        processingTime: processingTime || 2,
-        timestamp: timestamp(),
-        note: note || undefined,
-      });
-    } catch (error: any) {
-      // Clear timeout on error
-      if (networkTimeoutRef.current) clearTimeout(networkTimeoutRef.current);
-      paymentInProgress.current = false;
-      setSubmitting(false);
-
-      const copy = getPaymentFailureCopy(error);
-      const isTerminalFailure = copy.category === 'support';
-      if (isTerminalFailure) {
-        clearIntent();
-      }
-
-      // Navigate to Failure screen
-      navigation.replace('PaymentFailure', {
-        amount: amount,
-        recipientName: effectiveRecipientName || displayId,
-        recipientAddress: recipientAddress.trim(),
-        errorMessage: copy.errorMessage,
-        errorReason: copy.errorReason,
-        errorCode: copy.errorCode,
-        category: copy.category,
-        timestamp: timestamp(),
-        note: note || undefined,
-        idempotencyKey: isTerminalFailure ? undefined : activeIntentKey,
-      });
-    }
   };
 
   const handlePasteAddress = async () => {
@@ -547,13 +315,7 @@ export const SendMoneyScreen: React.FC<SendMoneyScreenProps> = ({ navigation, ro
       {!isFromQR && recipientFetched && (
         <TouchableOpacity
           style={styles.changeRecipientButton}
-          onPress={() => {
-            setRecipientInput('');
-            setRecipientAddress('');
-            setRecipientName('');
-            setRecipientCPayId('');
-            setRecipientFetched(false);
-          }}
+          onPress={resetRecipient}
         >
           <Text style={styles.changeRecipientText}>Change Recipient</Text>
         </TouchableOpacity>
@@ -593,7 +355,7 @@ export const SendMoneyScreen: React.FC<SendMoneyScreenProps> = ({ navigation, ro
         amount={amount}
         note={note}
         submitting={submitting}
-        onConfirm={executePayment}
+        onConfirm={() => executePayment(() => setShowReview(false))}
         onCancel={() => {
           if (!submitting) setShowReview(false);
         }}
