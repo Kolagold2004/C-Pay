@@ -68,6 +68,9 @@ const ingestWorker = new IngestWorker({
 });
 
 let lowBalanceAlertSent = false;
+const PREPARED_ACCOUNT_TRANSACTION_TTL_MS = 5 * 60 * 1000;
+const MAX_PREPARED_ACCOUNT_TRANSACTIONS = 10000;
+const preparedAccountTransactions = new Map();
 
 app.use(helmet());
 app.use(cors({ origin: parseCorsOrigin(process.env.CORS_ORIGIN || '*') }));
@@ -291,6 +294,8 @@ app.post('/accounts/prepare', requireAuthenticatedUser, async (req, res) => {
     .build();
   transaction.sign(sponsorKeypair);
 
+  rememberPreparedAccountTransaction(req.auth?.sub || 'auth-disabled', transaction);
+
   res.json({
     alreadyReady: false,
     accountId,
@@ -304,15 +309,33 @@ app.post('/accounts/prepare', requireAuthenticatedUser, async (req, res) => {
 app.post('/accounts/submit', requireAuthenticatedUser, requireWalletOwnership(), async (req, res) => {
   const signedXdr = assertTransactionEnvelopeXdr(req.body.signedXdr);
   const tx = StellarSdk.TransactionBuilder.fromXDR(signedXdr, config.passphrase);
-  
-  if (req.resolvedWallets && !req.resolvedWallets.includes(tx.source)) {
+
+  const authUid = req.auth?.sub || 'auth-disabled';
+  const prepared = getPreparedAccountTransaction(authUid, tx);
+  if (!prepared) {
     return res.status(403).json({
-      error: 'You are not authorized to submit transactions for this wallet',
+      error: 'This transaction was not prepared for your account or has expired',
       code: 'WALLET_OWNERSHIP_DENIED',
     });
   }
 
-  const result = await server.submitTransaction(tx);
+  if (prepared.inFlight) {
+    return res.status(409).json({
+      error: 'This account setup is already being submitted',
+      code: 'ACCOUNT_SETUP_IN_FLIGHT',
+    });
+  }
+  prepared.inFlight = true;
+
+  let result;
+  try {
+    result = await server.submitTransaction(tx);
+  } catch (error) {
+    prepared.inFlight = false;
+    throw error;
+  }
+
+  preparedAccountTransactions.delete(prepared.key);
 
   res.json({
     hash: result.hash,
@@ -652,6 +675,7 @@ module.exports = {
   ingestWorker,
   ...(process.env.NODE_ENV === 'test' ? {
     testHooks: Object.freeze({
+      stellarServer: server,
       acquireAddMoneyUserLock,
       releaseAddMoneyUserLock,
       acquireIdempotencyLock,
@@ -924,6 +948,65 @@ async function checkSponsorBalanceAlarm() {
  *
  * @param {string} walletField - The req.body key that holds the wallet address.
  */
+function preparedAccountTransactionKey(authUid, transactionHash) {
+  return `${authUid}:${transactionHash}`;
+}
+
+function serializeDecoratedSignature(signature) {
+  return Buffer.from(signature.toXDR()).toString('base64');
+}
+
+function prunePreparedAccountTransactions(now = Date.now()) {
+  for (const [key, prepared] of preparedAccountTransactions) {
+    if (prepared.expiresAt <= now) {
+      preparedAccountTransactions.delete(key);
+    }
+  }
+
+  while (preparedAccountTransactions.size > MAX_PREPARED_ACCOUNT_TRANSACTIONS) {
+    const oldestKey = preparedAccountTransactions.keys().next().value;
+    if (!oldestKey) break;
+    preparedAccountTransactions.delete(oldestKey);
+  }
+}
+
+function rememberPreparedAccountTransaction(authUid, transaction) {
+  const firstSignature = transaction.signatures[0];
+  const sponsorSignature = firstSignature && serializeDecoratedSignature(firstSignature);
+  if (!sponsorSignature) {
+    throw new Error('Prepared account transaction is missing the sponsor signature');
+  }
+
+  const transactionHash = transaction.hash().toString('hex');
+  const key = preparedAccountTransactionKey(authUid, transactionHash);
+  const now = Date.now();
+  prunePreparedAccountTransactions(now);
+  preparedAccountTransactions.set(key, {
+    key,
+    expiresAt: now + PREPARED_ACCOUNT_TRANSACTION_TTL_MS,
+    sponsorSignature,
+    inFlight: false,
+  });
+  prunePreparedAccountTransactions(now);
+}
+
+function getPreparedAccountTransaction(authUid, transaction) {
+  prunePreparedAccountTransactions();
+  const transactionHash = transaction.hash().toString('hex');
+  const key = preparedAccountTransactionKey(authUid, transactionHash);
+  const prepared = preparedAccountTransactions.get(key);
+  if (!prepared) return null;
+
+  const hasUnchangedSponsorSignature = transaction.signatures.some(signature => {
+    try {
+      return serializeDecoratedSignature(signature) === prepared.sponsorSignature;
+    } catch {
+      return false;
+    }
+  });
+  return hasUnchangedSponsorSignature ? prepared : null;
+}
+
 function requireWalletOwnership(walletField) {
   return async function (req, res, next) {
     if (!config.authRequired) {
