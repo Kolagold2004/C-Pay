@@ -8,6 +8,7 @@ import { COLORS, SPACING, FONT_SIZES, BORDER_RADIUS, SHADOWS, createThemedStyles
 import { formatWalletFingerprint } from '../../utils/cpayId';
 import { AlertManager } from '../../utils/alert';
 import { InitialAvatar } from '../InitialAvatar';
+import { Logger } from '../../utils/logger';
 
 interface ProfileHeaderProps {
   profilePhoto: string | null;
@@ -57,7 +58,7 @@ export const ProfileHeader: React.FC<ProfileHeaderProps> = ({
         }
       }
     } catch (error) {
-      console.error('Error picking image:', error);
+      Logger.error('Error picking image:', error);
       AlertManager.alert('Error', 'Failed to update profile photo', undefined, { type: 'error' });
     }
   };

@@ -2,9 +2,9 @@ import { useState, useEffect } from 'react';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { supabase } from '../services/supabase';
 import { getCurrentUserCPayId } from '../utils/cpayId';
-import { AlertManager } from '../utils/alert';
 import { useFocusEffect } from '@react-navigation/native';
 import React from 'react';
+import { Logger } from '../utils/logger';
 
 export const useProfileData = () => {
   const [walletAddress, setWalletAddress] = useState<string>('');
@@ -42,7 +42,7 @@ export const useProfileData = () => {
         if (localName) setDisplayName(localName);
       }
     } catch (error) {
-      console.error('Error loading display name:', error);
+      Logger.error('Error loading display name:', error);
       const localName = await AsyncStorage.getItem('display_name');
       if (localName) setDisplayName(localName);
     }
@@ -71,7 +71,7 @@ export const useProfileData = () => {
         if (localPhoto) setProfilePhoto(localPhoto);
       }
     } catch (error) {
-      console.error('Error loading profile photo:', error);
+      Logger.error('Error loading profile photo:', error);
     }
   };
 
@@ -134,7 +134,7 @@ export const useProfileData = () => {
         });
 
       if (uploadError) {
-        console.error('Upload error details:', uploadError);
+        Logger.error('Upload error details:', uploadError);
         return null;
       }
 
@@ -149,12 +149,12 @@ export const useProfileData = () => {
         .update({ profile_photo_url: publicUrl })
         .eq('wallet_address', address);
 
-      if (dbError) console.error('Database update error:', dbError);
+      if (dbError) Logger.error('Database update error:', dbError);
 
       await AsyncStorage.setItem('profile_photo', publicUrl);
       return publicUrl;
     } catch (error) {
-      console.error('Error uploading profile photo:', error);
+      Logger.error('Error uploading profile photo:', error);
       return null;
     }
   };
