@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React from 'react';
 
 // Profile screen: wallet identity, photo, and account settings.
 import {
@@ -7,26 +7,14 @@ import {
   StyleSheet,
   TouchableOpacity,
   Switch,
-  Image,
-  Platform,
 } from 'react-native';
-import * as Clipboard from 'expo-clipboard';
-import * as ImagePicker from 'expo-image-picker';
-import * as MediaLibrary from 'expo-media-library';
-import * as Sharing from 'expo-sharing';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import QRCode from 'react-native-qrcode-svg';
-import ViewShot from 'react-native-view-shot';
 import { Ionicons } from '@expo/vector-icons';
-import { InitialAvatar } from '../components/InitialAvatar';
-import { useFocusEffect } from '@react-navigation/native';
-import { supabase } from '../services/supabase';
 import { COLORS, SPACING, FONT_SIZES, BORDER_RADIUS, SHADOWS, createThemedStyles, useTheme } from '../constants/theme';
 import { Screen, Section, ActionRow } from '../components';
+import { ProfileHeader, ProfileQRCode } from '../components/profile';
+import { useProfileData } from '../hooks/useProfileData';
 import { AlertManager } from '../utils/alert';
-import { formatWalletFingerprint, getCurrentUserCPayId } from '../utils/cpayId';
-import { getMediaLibraryDownloadErrorMessage, requestPhotoSavePermission } from '../utils/mediaLibrary';
-import { Logger } from '../utils/logger';
 import { clearSessionPin } from '../services/wallet';
 interface ProfileScreenProps {
   navigation: any;
@@ -34,240 +22,16 @@ interface ProfileScreenProps {
 
 export const ProfileScreen: React.FC<ProfileScreenProps> = ({ navigation }) => {
   useTheme();
-  const [walletAddress, setWalletAddress] = useState<string>('');
-  const [cpayId, setCpayId] = useState<string>('');
-  const [displayName, setDisplayName] = useState<string>('');
-  const [notificationsEnabled, setNotificationsEnabled] = useState<boolean>(true);
-  const [profilePhoto, setProfilePhoto] = useState<string | null>(null);
-  const [showQRCode, setShowQRCode] = useState<boolean>(false);
-  const qrCodeRef = useRef<any>(null);
-
-  useEffect(() => {
-    loadWalletAddress();
-    loadCPayId();
-    loadDisplayName();
-    loadSettings();
-    loadProfilePhoto();
-
-    return undefined;
-  }, []);
-
-  useFocusEffect(
-    React.useCallback(() => {
-      loadCPayId();
-      loadDisplayName();
-      loadProfilePhoto();
-      loadSettings();
-    }, [])
-  );
-
-  const loadWalletAddress = async () => {
-    const address = await AsyncStorage.getItem('wallet_address');
-    if (address) setWalletAddress(address);
-  };
-
-  const loadCPayId = async () => {
-    const id = await getCurrentUserCPayId();
-    if (id) setCpayId(id);
-  };
-
-  const loadDisplayName = async () => {
-    try {
-      const address = await AsyncStorage.getItem('wallet_address');
-      if (!address) return;
-
-      const { data, error } = await supabase
-        .from('users')
-        .select('display_name')
-        .eq('wallet_address', address)
-        .single();
-
-      if (!error && data?.display_name) {
-        setDisplayName(data.display_name);
-        await AsyncStorage.setItem('display_name', data.display_name);
-      } else {
-        const localName = await AsyncStorage.getItem('display_name');
-        if (localName) setDisplayName(localName);
-      }
-    } catch (error) {
-      Logger.error('Error loading display name:', error);
-      const localName = await AsyncStorage.getItem('display_name');
-      if (localName) setDisplayName(localName);
-    }
-  };
-
-  const loadSettings = async () => {
-    const notifSetting = await AsyncStorage.getItem('notifications_enabled');
-    setNotificationsEnabled(notifSetting !== 'false');
-  };
-
-  const loadProfilePhoto = async () => {
-    try {
-      const address = await AsyncStorage.getItem('wallet_address');
-      if (!address) return;
-
-      const { data, error } = await supabase
-        .from('users')
-        .select('profile_photo_url')
-        .eq('wallet_address', address)
-        .single();
-
-      if (!error && data?.profile_photo_url) {
-        setProfilePhoto(data.profile_photo_url);
-      } else {
-        const localPhoto = await AsyncStorage.getItem('profile_photo');
-        if (localPhoto) setProfilePhoto(localPhoto);
-      }
-    } catch (error) {
-      Logger.error('Error loading profile photo:', error);
-    }
-  };
-
-  const handlePickImage = async () => {
-    try {
-      const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
-      if (status !== 'granted') {
-        AlertManager.alert('Permission Required', 'Please allow access to your photos to change your profile picture.');
-        return;
-      }
-
-      const result = await ImagePicker.launchImageLibraryAsync({
-        mediaTypes: ['images'],
-        allowsEditing: true,
-        aspect: [1, 1],
-        quality: 0.5,
-      });
-
-      if (!result.canceled && result.assets[0]) {
-        const photoUri = result.assets[0].uri;
-        AlertManager.alert('Uploading', 'Uploading your profile photo...');
-        const uploaded = await uploadProfilePhoto(photoUri);
-        if (uploaded) {
-          setProfilePhoto(uploaded);
-          AlertManager.alert('Success', 'Profile photo updated and synced to cloud!', undefined, { type: 'success' });
-        } else {
-          setProfilePhoto(photoUri);
-          await AsyncStorage.setItem('profile_photo', photoUri);
-          AlertManager.alert('Saved Locally', 'Photo saved on device. Cloud sync unavailable.');
-        }
-      }
-    } catch (error) {
-      Logger.error('Error picking image:', error);
-      AlertManager.alert('Error', 'Failed to update profile photo', undefined, { type: 'error' });
-    }
-  };
-
-  const uploadProfilePhoto = async (photoUri: string): Promise<string | null> => {
-    try {
-      const address = await AsyncStorage.getItem('wallet_address');
-      if (!address) return null;
-
-      const base64 = await fetch(photoUri)
-        .then(res => res.blob())
-        .then(blob => {
-          return new Promise<string>((resolve, reject) => {
-            const reader = new FileReader();
-            reader.onloadend = () => {
-              const base64data = reader.result as string;
-              resolve(base64data.split(',')[1]);
-            };
-            reader.onerror = reject;
-            reader.readAsDataURL(blob);
-          });
-        });
-
-      const fileExt = photoUri.split('.').pop()?.split('?')[0] || 'jpg';
-      const fileName = `${address.substring(0, 8)}_${Date.now()}.${fileExt}`;
-      const filePath = `profile-photos/${fileName}`;
-
-      const binaryString = atob(base64);
-      const bytes = new Uint8Array(binaryString.length);
-      for (let i = 0; i < binaryString.length; i++) {
-        bytes[i] = binaryString.charCodeAt(i);
-      }
-
-      const { error: uploadError } = await supabase.storage
-        .from('profile-images')
-        .upload(filePath, bytes.buffer, {
-          contentType: `image/${fileExt}`,
-          upsert: true,
-        });
-
-      if (uploadError) {
-        Logger.error('Upload error details:', uploadError);
-        return null;
-      }
-
-      const { data: urlData } = supabase.storage
-        .from('profile-images')
-        .getPublicUrl(filePath);
-
-      const publicUrl = urlData.publicUrl;
-
-      const { error: dbError } = await supabase
-        .from('users')
-        .update({ profile_photo_url: publicUrl })
-        .eq('wallet_address', address);
-
-      if (dbError) Logger.error('Database update error:', dbError);
-
-      await AsyncStorage.setItem('profile_photo', publicUrl);
-      return publicUrl;
-    } catch (error) {
-      Logger.error('Error uploading profile photo:', error);
-      return null;
-    }
-  };
-
-  const handleCopyAddress = async () => {
-    const idToCopy = cpayId || formatWalletFingerprint(walletAddress);
-    await Clipboard.setStringAsync(idToCopy);
-    AlertManager.alert('Copied', 'Your C-Pay ID was copied to the clipboard.', undefined, { type: 'success' });
-  };
-
-  const handleShowQRCode = () => setShowQRCode((current) => !current);
-
-  const handleShareQRCode = async () => {
-    try {
-      if (!qrCodeRef.current) return;
-      const uri = await qrCodeRef.current.capture();
-      if (await Sharing.isAvailableAsync()) {
-        await Sharing.shareAsync(uri, {
-          mimeType: 'image/png',
-          dialogTitle: 'Scan this QR code to send me pilot credits on C-Pay.',
-          UTI: 'public.png',
-        });
-      } else {
-        AlertManager.alert('Not Available', 'Sharing is not available on this device');
-      }
-    } catch (error) {
-      Logger.error('Error sharing QR code:', error);
-      AlertManager.alert('Error', 'Failed to share QR code', undefined, { type: 'error' });
-    }
-  };
-
-  const handleDownloadQRCode = async () => {
-    try {
-      const hasPermission = await requestPhotoSavePermission();
-      if (!hasPermission) {
-        AlertManager.alert('Permission Required', 'Please allow access to save the QR code to your gallery.');
-        return;
-      }
-      if (qrCodeRef.current) {
-        const uri = await qrCodeRef.current.capture();
-        await MediaLibrary.createAssetAsync(uri);
-        AlertManager.alert('Saved', 'QR code saved to your gallery.', undefined, { type: 'success' });
-      }
-    } catch (error) {
-      Logger.error('Error downloading QR code:', error);
-      AlertManager.alert('Error', getMediaLibraryDownloadErrorMessage(error), undefined, { type: 'error' });
-    }
-  };
-
-  const handleToggleNotifications = async (value: boolean) => {
-    setNotificationsEnabled(value);
-    await AsyncStorage.setItem('notifications_enabled', value.toString());
-  };
+  const {
+    walletAddress,
+    cpayId,
+    displayName,
+    notificationsEnabled,
+    profilePhoto,
+    setProfilePhoto,
+    handleToggleNotifications,
+    uploadProfilePhoto,
+  } = useProfileData();
 
   const handleSignOut = () => {
     AlertManager.alert(
@@ -296,80 +60,20 @@ export const ProfileScreen: React.FC<ProfileScreenProps> = ({ navigation }) => {
 
   return (
     <Screen topInset={false}>
-      {/* Identity */}
-      <View style={styles.profileHeader}>
-        <TouchableOpacity style={styles.profilePhotoContainer} onPress={handlePickImage}>
-          {profilePhoto ? <Image source={{ uri: profilePhoto }} style={styles.profilePhoto} /> : <InitialAvatar name={displayName || 'User'} id={walletAddress} size={100} style={styles.profilePhoto} />}
-          <View style={styles.editIconContainer}>
-            <Ionicons name="camera-outline" size={15} color={COLORS.primary} />
-          </View>
-        </TouchableOpacity>
-
-        {!!displayName && <Text style={styles.profileName}>{displayName}</Text>}
-        <TouchableOpacity style={styles.addressContainer} onPress={handleCopyAddress} activeOpacity={0.7}>
-          <Text style={styles.profileAddress}>{cpayId || formatWalletFingerprint(walletAddress)}</Text>
-          <Ionicons name="copy-outline" size={20} color={COLORS.primary} />
-        </TouchableOpacity>
-      </View>
-
-      {/* QR code */}
-      <View style={styles.section}>
-        <TouchableOpacity style={styles.qrCodeCard} onPress={handleShowQRCode} activeOpacity={0.8}>
-          <View style={styles.qrCodeHeader}>
-            <View style={styles.qrCodeHeaderLeft}>
-              <Ionicons name="qr-code-outline" size={24} color={COLORS.primary} style={styles.qrCodeIcon} />
-              <Text style={styles.qrCodeTitle}>My QR Code</Text>
-            </View>
-            <Ionicons name={showQRCode ? 'chevron-up' : 'chevron-down'} size={22} color={COLORS.textMuted} />
-          </View>
-
-          {showQRCode && (
-            <View style={styles.qrCodeContent}>
-              <ViewShot ref={qrCodeRef} options={{ format: 'png', quality: 1.0 }}>
-                <View style={styles.shareableQRCard}>
-                  <View style={styles.shareCardProfile}>
-                    {profilePhoto ? <Image source={{ uri: profilePhoto }} style={styles.shareCardProfilePhoto} /> : <InitialAvatar name={displayName || 'User'} id={walletAddress} size={70} style={styles.shareCardProfilePhoto} />}
-                    {!!displayName && <Text style={styles.shareCardName}>{displayName}</Text>}
-                    <Text style={styles.shareCardAddress}>{cpayId || formatWalletFingerprint(walletAddress)}</Text>
-                  </View>
-
-                  <View style={styles.qrCodeWrapper}>
-                    <QRCode
-                      value={JSON.stringify({ type: 'cryptopay', recipient: walletAddress, amount: '0', name: displayName || 'C-Pay User' })}
-                      size={220}
-                      backgroundColor="white"
-                      color={COLORS.primary}
-                      logo={require('../../assets/cpay_logo.png')}
-                      logoSize={45}
-                      logoBackgroundColor="white"
-                      logoMargin={2}
-                    />
-                  </View>
-
-                  <View style={styles.shareCardFooter}>
-                    <Text style={styles.shareCardFooterText}>Scan to send pilot credits</Text>
-                  </View>
-                </View>
-              </ViewShot>
-              <Text style={styles.qrCodeDescription}>
-                Let others scan this QR code to send you pilot credits
-              </Text>
-
-              <View style={styles.qrActionButtons}>
-                <TouchableOpacity style={styles.qrActionButton} onPress={handleDownloadQRCode}>
-                  <Ionicons name="download-outline" size={20} color={COLORS.text} />
-                  <Text style={styles.qrActionButtonText}>Download</Text>
-                </TouchableOpacity>
-
-                <TouchableOpacity style={[styles.qrActionButton, styles.qrShareButton]} onPress={handleShareQRCode}>
-                  <Ionicons name="share-social-outline" size={20} color={COLORS.textInverse} />
-                  <Text style={[styles.qrActionButtonText, styles.shareButtonText]}>Share</Text>
-                </TouchableOpacity>
-              </View>
-            </View>
-          )}
-        </TouchableOpacity>
-      </View>
+      <ProfileHeader
+        profilePhoto={profilePhoto}
+        displayName={displayName}
+        cpayId={cpayId}
+        walletAddress={walletAddress}
+        setProfilePhoto={setProfilePhoto}
+        uploadProfilePhoto={uploadProfilePhoto}
+      />
+      <ProfileQRCode
+        profilePhoto={profilePhoto}
+        displayName={displayName}
+        cpayId={cpayId}
+        walletAddress={walletAddress}
+      />
 
       {/* Security — kept near the top so security actions aren't buried */}
       <Section title="Security">
@@ -475,9 +179,6 @@ export const ProfileScreen: React.FC<ProfileScreenProps> = ({ navigation }) => {
 };
 
 const styles = createThemedStyles((COLORS) => ({
-  section: {
-    marginBottom: SPACING.xl,
-  },
   card: {
     backgroundColor: COLORS.surface,
     borderRadius: BORDER_RADIUS.lg,

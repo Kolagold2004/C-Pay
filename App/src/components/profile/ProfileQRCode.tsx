@@ -10,6 +10,7 @@ import { formatWalletFingerprint } from '../../utils/cpayId';
 import { AlertManager } from '../../utils/alert';
 import { getMediaLibraryDownloadErrorMessage, requestPhotoSavePermission } from '../../utils/mediaLibrary';
 import { InitialAvatar } from '../InitialAvatar';
+import { Logger } from '../../utils/logger';
 
 interface ProfileQRCodeProps {
   profilePhoto: string | null;
@@ -44,7 +45,7 @@ export const ProfileQRCode: React.FC<ProfileQRCodeProps> = ({
         AlertManager.alert('Not Available', 'Sharing is not available on this device');
       }
     } catch (error) {
-      console.error('Error sharing QR code:', error);
+      Logger.error('Error sharing QR code:', error);
       AlertManager.alert('Error', 'Failed to share QR code', undefined, { type: 'error' });
     }
   };
@@ -62,7 +63,7 @@ export const ProfileQRCode: React.FC<ProfileQRCodeProps> = ({
         AlertManager.alert('Saved', 'QR code saved to your gallery.', undefined, { type: 'success' });
       }
     } catch (error) {
-      console.error('Error downloading QR code:', error);
+      Logger.error('Error downloading QR code:', error);
       AlertManager.alert('Error', getMediaLibraryDownloadErrorMessage(error), undefined, { type: 'error' });
     }
   };
