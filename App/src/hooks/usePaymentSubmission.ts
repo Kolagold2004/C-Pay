@@ -6,6 +6,7 @@ import { transferTokens } from '../services/blockchain';
 import { saveTransaction } from '../services/storage';
 import { AlertManager } from '../utils/alert';
 import { getPaymentFailureCopy } from '../utils/paymentFailure';
+import { Logger } from '../utils/logger';
 
 interface UsePaymentSubmissionProps {
   navigation: any;
@@ -121,8 +122,7 @@ export const usePaymentSubmission = ({
       };
 
       saveTransaction(transactionData)
-        .then(() => console.log('✅ Transaction saved and synced'))
-        .catch(err => console.error('❌ Transaction save/sync error:', err));
+        .catch(err => Logger.error('Transaction save/sync error:', err));
 
       navigation.replace('PaymentSuccess', {
         transactionHash: txHash,

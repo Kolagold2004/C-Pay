@@ -2,6 +2,7 @@ import { useState, useRef } from 'react';
 import { isValidAccountId } from '../services/blockchain';
 import { getUserDisplayName } from '../services/storage';
 import { getCPayIdByWallet, formatWalletFingerprint, isValidCPayId, getWalletAddressFromCPayId } from '../utils/cpayId';
+import { Logger } from '../utils/logger';
 
 export const useRecipientLookup = (walletAddress: string, isFromQR: boolean) => {
   const [recipientInput, setRecipientInput] = useState<string>('');
@@ -58,7 +59,7 @@ export const useRecipientLookup = (walletAddress: string, isFromQR: boolean) => 
         setRecipientFetched(false);
       }
     } catch (error) {
-      console.log('Error fetching recipient name:', error);
+      Logger.info('Error fetching recipient name:', error);
       setRecipientName('');
       setRecipientCPayId('');
       setRecipientFetched(false);
@@ -93,7 +94,7 @@ export const useRecipientLookup = (walletAddress: string, isFromQR: boolean) => 
           setRecipientFetched(false);
         }
       } catch (error) {
-        console.error('Error looking up C-Pay ID:', error);
+        Logger.error('Error looking up C-Pay ID:', error);
       } finally {
         setFetchingRecipient(false);
       }
