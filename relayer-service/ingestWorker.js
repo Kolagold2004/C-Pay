@@ -1,11 +1,50 @@
 'use strict';
 
+const crypto = require('crypto');
 const StellarSdk = require('@stellar/stellar-sdk');
 
 const DEFAULT_CURSOR_KEY = 'horizon_payments_cursor';
 const DEFAULT_POLL_INTERVAL_MS = 5000;
 const DEFAULT_PENDING_TIMEOUT_MS = 300000; // 5 minutes
 const DEFAULT_RECONCILE_INTERVAL_MS = 30000; // 30 seconds
+const DEFAULT_WALLET_CACHE_MAX_SIZE = 5000;
+const DEFAULT_LEADER_LEASE_TTL_MS = 30000; // 30 seconds
+
+/**
+ * Bounded LRU Map for caching wallet addresses to user IDs.
+ * Eviction policy:
+ * - Maximum capacity: maxSize (default: 5000 entries).
+ * - Eviction strategy: Least Recently Used (LRU). When capacity is reached,
+ *   the oldest/least recently accessed item is evicted upon inserting new entries.
+ * - Cache hits promote accessed keys to most recently used.
+ */
+class BoundedLruMap extends Map {
+  constructor(maxSize = DEFAULT_WALLET_CACHE_MAX_SIZE) {
+    super();
+    this.maxSize = maxSize;
+  }
+
+  get(key) {
+    if (!super.has(key)) return undefined;
+    const value = super.get(key);
+    super.delete(key);
+    super.set(key, value);
+    return value;
+  }
+
+  set(key, value) {
+    if (super.has(key)) {
+      super.delete(key);
+    } else if (this.size >= this.maxSize) {
+      const oldestKey = this.keys().next().value;
+      if (oldestKey !== undefined) {
+        super.delete(oldestKey);
+      }
+    }
+    super.set(key, value);
+    return this;
+  }
+}
 
 class IngestWorker {
   constructor(options = {}) {
@@ -41,8 +80,15 @@ class IngestWorker {
     this.isPolling = false;
     this.isReconciling = false;
 
-    // Cache of known wallet addresses to user IDs
-    this.walletUserCache = new Map();
+    this.workerId = options.workerId || (crypto.randomUUID ? crypto.randomUUID() : `worker-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
+    this.leaderKey = options.leaderKey || 'ingest_leader';
+    this.leaderLeaseTtlMs = Number(options.leaderLeaseTtlMs || process.env.INGEST_LEADER_LEASE_TTL_MS || DEFAULT_LEADER_LEASE_TTL_MS);
+    this.isLeader = false;
+    this.leaderHeartbeatTimer = null;
+
+    this.maxWalletCacheSize = Number(options.maxWalletCacheSize || process.env.INGEST_WALLET_CACHE_MAX_SIZE || DEFAULT_WALLET_CACHE_MAX_SIZE);
+    // Bounded LRU cache of known wallet addresses to user IDs
+    this.walletUserCache = new BoundedLruMap(this.maxWalletCacheSize);
     this.lastCacheRefresh = 0;
   }
 
@@ -75,6 +121,13 @@ class IngestWorker {
 
     this.status = 'running';
     try {
+      const isLeader = await this.acquireOrRenewLeaderLease();
+      if (!isLeader) {
+        console.log(`[IngestWorker] Standby mode: another instance holds leader lease. Monitoring heartbeat...`);
+        this.startLeaderHeartbeat(mode);
+        return;
+      }
+
       await this.initCursor();
       await this.refreshWalletCache();
 
@@ -85,7 +138,8 @@ class IngestWorker {
       }
 
       this.startReconciliation();
-      console.log(`[IngestWorker] Started in ${mode} mode from cursor ${this.lastCursor || 'now'}`);
+      this.startLeaderHeartbeat(mode);
+      console.log(`[IngestWorker] Started in ${mode} mode as leader from cursor ${this.lastCursor || 'now'}`);
     } catch (err) {
       this.status = 'error';
       this.lastError = this.classifyError(err);
@@ -95,8 +149,86 @@ class IngestWorker {
     }
   }
 
-  async stop() {
-    this.status = 'stopped';
+  async acquireOrRenewLeaderLease() {
+    if (!this.isConfigured) {
+      this.isLeader = true;
+      return true;
+    }
+
+    const now = Date.now();
+    try {
+      const records = await this.supabaseRequest(
+        `ingest_state?key=eq.${encodeURIComponent(this.leaderKey)}&select=key,cursor,last_ledger,updated_at`
+      );
+
+      if (Array.isArray(records) && records.length > 0) {
+        const lease = records.find(r => r.key === this.leaderKey) || records[0];
+        if (lease && lease.key === this.leaderKey) {
+          const lastUpdated = lease.updated_at ? new Date(lease.updated_at).getTime() : 0;
+          const isSelf = lease.cursor === this.workerId;
+          const isExpired = now - lastUpdated > this.leaderLeaseTtlMs;
+
+          if (!isSelf && !isExpired) {
+            this.isLeader = false;
+            return false;
+          }
+        }
+      }
+
+      await this.supabaseRequest('ingest_state', {
+        method: 'POST',
+        headers: {
+          Prefer: 'resolution=merge-duplicates',
+        },
+        body: JSON.stringify({
+          key: this.leaderKey,
+          cursor: this.workerId,
+          last_ledger: null,
+          updated_at: new Date(now).toISOString(),
+        }),
+      });
+
+      this.isLeader = true;
+      return true;
+    } catch (err) {
+      console.warn('[IngestWorker] Leader lease check warning:', err.message);
+      return this.isLeader;
+    }
+  }
+
+  startLeaderHeartbeat(mode = 'stream') {
+    if (this.leaderHeartbeatTimer) return;
+    const intervalMs = Math.max(5000, Math.floor(this.leaderLeaseTtlMs / 3));
+    this.leaderHeartbeatTimer = setInterval(async () => {
+      if (this.status !== 'running') return;
+      const wasLeader = this.isLeader;
+      const acquired = await this.acquireOrRenewLeaderLease();
+
+      if (acquired && !wasLeader) {
+        console.log(`[IngestWorker] Acquired leadership lease. Promoting to active ingest worker.`);
+        try {
+          await this.initCursor();
+          await this.refreshWalletCache();
+          if (mode === 'stream') {
+            this.startStreaming();
+          } else {
+            this.startPolling();
+          }
+          this.startReconciliation();
+        } catch (err) {
+          console.error('[IngestWorker] Error during promotion to leader:', err.message);
+        }
+      } else if (!acquired && wasLeader) {
+        console.warn(`[IngestWorker] Lost leadership lease. Demoting to standby.`);
+        this.stopStreamingOrPolling();
+      }
+    }, intervalMs);
+    if (this.leaderHeartbeatTimer.unref) {
+      this.leaderHeartbeatTimer.unref();
+    }
+  }
+
+  stopStreamingOrPolling() {
     if (this.streamCloseFn) {
       try {
         this.streamCloseFn();
@@ -110,6 +242,23 @@ class IngestWorker {
     if (this.reconcileTimer) {
       clearInterval(this.reconcileTimer);
       this.reconcileTimer = null;
+    }
+  }
+
+  async stop() {
+    this.status = 'stopped';
+    if (this.leaderHeartbeatTimer) {
+      clearInterval(this.leaderHeartbeatTimer);
+      this.leaderHeartbeatTimer = null;
+    }
+    this.stopStreamingOrPolling();
+    if (this.isLeader && this.isConfigured) {
+      try {
+        await this.supabaseRequest(`ingest_state?key=eq.${encodeURIComponent(this.leaderKey)}`, {
+          method: 'DELETE',
+        });
+      } catch (_) {}
+      this.isLeader = false;
     }
     console.log('[IngestWorker] Stopped');
   }
@@ -173,7 +322,7 @@ class IngestWorker {
       if (now - this.lastCacheRefresh < 60000 && this.walletUserCache.size > 0) {
         return;
       }
-      const users = await this.supabaseRequest('users?select=id,wallet_address');
+      const users = await this.supabaseRequest(`users?select=id,wallet_address&limit=${this.maxWalletCacheSize}`);
       if (Array.isArray(users)) {
         this.walletUserCache.clear();
         for (const u of users) {
@@ -189,6 +338,27 @@ class IngestWorker {
       this.lastError = this.classifyError(err);
       console.warn('[IngestWorker] Failed to refresh wallet cache:', err.message);
     }
+  }
+
+  async getUserIdForWallet(walletAddress) {
+    if (!walletAddress) return null;
+    const cached = this.walletUserCache.get(walletAddress);
+    if (cached) return cached;
+    if (!this.isConfigured) return null;
+
+    try {
+      const records = await this.supabaseRequest(
+        `users?wallet_address=eq.${encodeURIComponent(walletAddress)}&select=id&limit=1`
+      );
+      if (Array.isArray(records) && records.length > 0 && records[0].id) {
+        const userId = records[0].id;
+        this.walletUserCache.set(walletAddress, userId);
+        return userId;
+      }
+    } catch (err) {
+      console.warn('[IngestWorker] Failed to query user for wallet:', err.message);
+    }
+    return null;
   }
 
   startStreaming() {
@@ -303,9 +473,17 @@ class IngestWorker {
       return;
     }
 
-    // Match users - restrict ingestion to known accounts
-    const fromUserId = this.walletUserCache.get(details.from_address) || null;
-    const toUserId = this.walletUserCache.get(details.to_address) || null;
+    // Match users - restrict ingestion to known accounts (bounded cache with on-demand DB resolution)
+    let fromUserId = this.walletUserCache.get(details.from_address) || null;
+    if (!fromUserId && details.from_address) {
+      fromUserId = await this.getUserIdForWallet(details.from_address);
+    }
+
+    let toUserId = this.walletUserCache.get(details.to_address) || null;
+    if (!toUserId && details.to_address) {
+      toUserId = await this.getUserIdForWallet(details.to_address);
+    }
+
     const matchedUserId = fromUserId || toUserId;
 
     if (!matchedUserId) {
@@ -525,6 +703,8 @@ class IngestWorker {
     return {
       status: this.status,
       healthy: isHealthy,
+      isLeader: this.isLeader,
+      workerId: this.workerId,
       lag: lag.ledgerLag,
       ...lag,
       metrics: {
@@ -563,8 +743,10 @@ class IngestWorker {
 
 module.exports = {
   IngestWorker,
+  BoundedLruMap,
   DEFAULT_CURSOR_KEY,
   DEFAULT_POLL_INTERVAL_MS,
   DEFAULT_PENDING_TIMEOUT_MS,
+  DEFAULT_WALLET_CACHE_MAX_SIZE,
 };
 
