@@ -11,7 +11,7 @@ import {
   ActivityIndicator,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { hasWallet } from '../services/wallet';
+import { hasWallet, recoverPendingPinChange } from '../services/wallet';
 import { COLORS, SPACING, TYPOGRAPHY, createThemedStyles, useTheme } from '../constants/theme';
 import { PILOT_NOTICE_TITLE } from '../utils/pilot';
 
@@ -34,6 +34,9 @@ export const SplashScreen: React.FC<SplashScreenProps> = ({ navigation }) => {
       // Keep the splash visible just long enough to avoid a hard flash.
       await new Promise(resolve => setTimeout(resolve, 500));
       
+      // On startup, detect and recover from any half-finished PIN change
+      await recoverPendingPinChange();
+
       // Check if user has already created wallet
       const walletExists = await hasWallet();
       Logger.info('Wallet exists:', walletExists);
