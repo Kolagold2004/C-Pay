@@ -50,6 +50,24 @@ class IngestWorker {
     return Boolean(this.supabaseUrl && this.supabaseServiceRoleKey);
   }
 
+  classifyError(err) {
+    if (!err) return null;
+    const msg = String(err.message || err);
+    if (/supabase|rest\/v1|postgrest|relation|column|table|PGRST|duplicate key|violates/i.test(msg)) {
+      return 'DATABASE_ERROR';
+    }
+    if (/horizon|stellar|fetch failed|network|ECONNREFUSED|ENOTFOUND|timeout|ETIMEDOUT/i.test(msg)) {
+      return 'NETWORK_ERROR';
+    }
+    if (/stream|eventSource/i.test(msg)) {
+      return 'STREAM_ERROR';
+    }
+    if (/cursor|ledger|op_index|token/i.test(msg)) {
+      return 'PARSE_ERROR';
+    }
+    return 'INGEST_ERROR';
+  }
+
   async start(mode = 'stream') {
     if (this.status === 'running') {
       return;
@@ -70,7 +88,7 @@ class IngestWorker {
       console.log(`[IngestWorker] Started in ${mode} mode from cursor ${this.lastCursor || 'now'}`);
     } catch (err) {
       this.status = 'error';
-      this.lastError = err.message;
+      this.lastError = this.classifyError(err);
       this.errorCount++;
       console.error('[IngestWorker] Failed to start:', err.message);
       throw err;
@@ -168,7 +186,7 @@ class IngestWorker {
       this.lastCacheRefresh = now;
     } catch (err) {
       this.errorCount++;
-      this.lastError = err.message;
+      this.lastError = this.classifyError(err);
       console.warn('[IngestWorker] Failed to refresh wallet cache:', err.message);
     }
   }
@@ -187,13 +205,14 @@ class IngestWorker {
           await this.processOperation(operation);
         } catch (err) {
           this.errorCount++;
-          this.lastError = err.message;
+          this.lastError = this.classifyError(err);
           console.error('[IngestWorker] Error processing streamed operation:', err.message);
         }
       },
       onerror: (err) => {
         console.warn('[IngestWorker] Stream error, falling back to polling:', err.message || err);
         this.errorCount++;
+        this.lastError = this.classifyError(err);
         if (this.streamCloseFn) {
           try {
             this.streamCloseFn();
@@ -216,7 +235,7 @@ class IngestWorker {
         await this.pollOnce();
       } catch (err) {
         this.errorCount++;
-        this.lastError = err.message;
+        this.lastError = this.classifyError(err);
         console.error('[IngestWorker] Poll error:', err.message);
       } finally {
         this.isPolling = false;
@@ -248,7 +267,7 @@ class IngestWorker {
       }
     } catch (err) {
       this.errorCount++;
-      this.lastError = err.message;
+      this.lastError = this.classifyError(err);
       console.warn('[IngestWorker] Failed to update latest ledger:', err.message);
     }
   }
@@ -372,7 +391,7 @@ class IngestWorker {
         return Number(bigToken & 4095n);
       } catch (err) {
         this.errorCount++;
-        this.lastError = err.message;
+        this.lastError = this.classifyError(err);
         console.warn('[IngestWorker] Failed to extract op index from token:', err.message);
       }
     }
@@ -396,7 +415,7 @@ class IngestWorker {
         }
       } catch (err) {
         this.errorCount++;
-        this.lastError = err.message;
+        this.lastError = this.classifyError(err);
         console.warn('[IngestWorker] Failed to extract ledger sequence from token:', err.message);
       }
     }
@@ -414,7 +433,7 @@ class IngestWorker {
       });
     } catch (err) {
       this.errorCount++;
-      this.lastError = err.message;
+      this.lastError = this.classifyError(err);
       console.warn('[IngestWorker] Upsert transaction failed:', err.message);
       throw err;
     }
@@ -428,6 +447,8 @@ class IngestWorker {
       try {
         await this.reconcilePendingTransactions();
       } catch (err) {
+        this.errorCount++;
+        this.lastError = this.classifyError(err);
         console.warn('[IngestWorker] Reconciliation error:', err.message);
       } finally {
         this.isReconciling = false;

@@ -926,6 +926,40 @@ describe('unauthenticated requests are rejected before ownership check', () => {
     expect(status).toBe(401);
     expect(body.code).toBe('AUTH_REQUIRED');
   });
+
+  it('returns 401 when no token is provided to /ingest/health', async () => {
+    const { status, body } = await getJson(
+      expressApp,
+      '/ingest/health'
+    );
+
+    expect(status).toBe(401);
+    expect(body.code).toBe('AUTH_REQUIRED');
+  });
+
+  it('returns 401 when no token is provided to /tx/:hash', async () => {
+    const { status, body } = await getJson(
+      expressApp,
+      '/tx/0000000000000000000000000000000000000000000000000000000000000000'
+    );
+
+    expect(status).toBe(401);
+    expect(body.code).toBe('AUTH_REQUIRED');
+  });
+
+  it('returns minimal service information on GET / without enumerating routes', async () => {
+    const { status, body } = await getJson(
+      expressApp,
+      '/'
+    );
+
+    expect(status).toBe(200);
+    expect(body).toEqual({
+      service: 'C-Pay Stellar Relayer',
+      health: '/health',
+    });
+    expect(body.endpoints).toBeUndefined();
+  });
 });
 
 // ── Payment transaction limits and velocity enforcement (#114) ───────────────
