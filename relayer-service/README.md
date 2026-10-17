@@ -41,15 +41,17 @@ retryable `503` and do not submit funds.
 
 ## Endpoints
 
-- `GET /health`
-- `GET /ingest/health`
-- `GET /account/:accountId/status`
-- `GET /account/:accountId/balance`
-- `POST /accounts/prepare`
-- `POST /accounts/submit`
-- `POST /payments/submit`
-- `POST /add-money`
-- `GET /tx/:hash`
+- `GET /`: Minimal service identifier and health check reference (route enumeration disabled)
+- `GET /health`: Unauthenticated minimal liveness probe (`{ "status": "ok" }`)
+- `GET /health/detailed`: Authenticated detailed health check including account balances and ingest status
+- `GET /ingest/health`: Authenticated ingest worker health and sanitized lag metrics
+- `GET /account/:accountId/status`: Authenticated wallet readiness check
+- `GET /account/:accountId/balance`: Authenticated wallet USDC balance check
+- `POST /accounts/prepare`: Authenticated prepared transaction creation
+- `POST /accounts/submit`: Authenticated user-signed transaction submission
+- `POST /payments/submit`: Authenticated sponsored payment submission
+- `POST /add-money`: Authenticated testnet faucet distribution
+- `GET /tx/:hash`: Authenticated, rate-limited Horizon transaction status lookup
 
 ## Multi-Instance Architecture & Coordination
 
