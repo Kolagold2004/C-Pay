@@ -86,7 +86,6 @@ type RestoreWalletRouteParams = {
   displayName?: string | null;
   cpayId?: string | null;
   profilePhotoUrl?: string | null;
-  phoneNumber?: string | null;
 };
 
 interface RestoreWalletScreenProps {
@@ -106,7 +105,6 @@ export const RestoreWalletScreen: React.FC<RestoreWalletScreenProps> = ({ naviga
     displayName,
     cpayId,
     profilePhotoUrl,
-    phoneNumber,
   } = route.params;
 
   const [state, setState] = useState<CheckState>('checking');
@@ -280,7 +278,6 @@ export const RestoreWalletScreen: React.FC<RestoreWalletScreenProps> = ({ naviga
     if (displayName) writes.push(['display_name', displayName]);
     if (cpayId) writes.push(['cpay_id', cpayId]);
     if (profilePhotoUrl) writes.push(['profile_photo', profilePhotoUrl]);
-    if (phoneNumber) writes.push(['phone_number', phoneNumber]);
 
     await AsyncStorage.multiSet(writes);
   };
@@ -509,7 +506,7 @@ export const RestoreWalletScreen: React.FC<RestoreWalletScreenProps> = ({ naviga
 
           <TouchableOpacity
             style={styles.secondaryButton}
-            onPress={() => navigation.replace('CreatePIN', { phoneNumber: '' })}
+            onPress={() => navigation.replace('CreatePIN')}
           >
             <Text style={styles.secondaryButtonText}>Create a New Wallet Instead</Text>
           </TouchableOpacity>
@@ -673,7 +670,7 @@ export const RestoreWalletScreen: React.FC<RestoreWalletScreenProps> = ({ naviga
 
             <TouchableOpacity
               style={styles.secondaryButton}
-              onPress={() => navigation.replace('CreatePIN', { phoneNumber: '' })}
+              onPress={() => navigation.replace('CreatePIN')}
               disabled={loading}
             >
               <Text style={styles.secondaryButtonText}>Create a New Wallet Instead</Text>

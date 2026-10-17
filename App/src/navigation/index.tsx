@@ -32,9 +32,9 @@ type RootStackParamList = {
   Splash: undefined;
   Onboarding: undefined;
   EmailVerification: undefined;
-  CreatePIN: { phoneNumber: string };
-  ConfirmPIN: { pin: string; phoneNumber: string };
-  ProfileSetup: { walletAddress: string; phoneNumber: string };
+  CreatePIN: undefined;
+  ConfirmPIN: { pin: string };
+  ProfileSetup: { walletAddress: string };
   ChangePIN: undefined;
   ForgotPIN: undefined;
   CloudBackupSetup: { fromSettings?: boolean } | undefined;
@@ -45,7 +45,6 @@ type RootStackParamList = {
     displayName?: string | null;
     cpayId?: string | null;
     profilePhotoUrl?: string | null;
-    phoneNumber?: string | null;
   };
   Login: undefined;
   MainTabs: undefined;

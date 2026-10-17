@@ -46,7 +46,6 @@ type ExistingUserProfile = {
   display_name?: string | null;
   cpay_id?: string | null;
   profile_photo_url?: string | null;
-  phone_number?: string | null;
 };
 
 interface EmailVerificationScreenProps {
@@ -133,7 +132,7 @@ export const EmailVerificationScreen: React.FC<EmailVerificationScreenProps> = (
 
     const { data, error } = await supabase
       .from('users')
-      .select('wallet_address, display_name, cpay_id, profile_photo_url, phone_number')
+      .select('wallet_address, display_name, cpay_id, profile_photo_url')
       .eq('auth_user_id', userId)
       .maybeSingle();
 
@@ -241,16 +240,13 @@ export const EmailVerificationScreen: React.FC<EmailVerificationScreenProps> = (
             displayName: existingProfile.display_name || null,
             cpayId: existingProfile.cpay_id || null,
             profilePhotoUrl: existingProfile.profile_photo_url || null,
-            phoneNumber: existingProfile.phone_number || null,
           });
           setLoading(false);
           verifyingRef.current = false;
           return;
         }
 
-        navigation.replace('CreatePIN', {
-          phoneNumber: '',
-        });
+        navigation.replace('CreatePIN');
       }
     } else {
       AlertManager.alert('Error', result.error || 'Invalid OTP');

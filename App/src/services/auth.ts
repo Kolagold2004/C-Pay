@@ -179,7 +179,7 @@ async function incrementAttempt(): Promise<void> {
 
 /**
  * Send an email OTP for the current login/onboarding verification flow.
- * This keeps the existing app-level OTP request limit while phone OTP is paused.
+ * Email is the only sign-in method; this keeps the app-level OTP request limit.
  */
 export async function sendLoginEmailOTP(email: string): Promise<{
   success: boolean;
@@ -306,8 +306,10 @@ export async function signOut(): Promise<void> {
   await supabase.auth.signOut();
   await AsyncStorage.multiRemove([
     'auth_token',
+    // Legacy phone-OTP keys: no longer written, cleared from older installs.
     'phone_verified',
     'phone_number',
+    'user_phone',
     'email_verified',
     'user_email',
   ]);

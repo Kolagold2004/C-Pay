@@ -2,7 +2,6 @@ import { Logger } from '../utils/logger';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { supabase } from './supabase';
 import EventEmitter from 'eventemitter3';
-import { generateCPayId } from '../utils/cpayId';
 import { getNetworkConfig, isValidTransactionHash, isValidAccountId } from './blockchain';
 
 // Event emitter for real-time updates
@@ -36,11 +35,6 @@ export interface Transaction {
 // Hybrid storage: Local (AsyncStorage) + Cloud (Supabase)
 // Works offline, syncs when online
 
-async function getCurrentAuthUserId(): Promise<string | null> {
-  const { data } = await supabase.auth.getSession();
-  return data.session?.user.id || null;
-}
-
 // Helper function to get user's display name from Supabase by wallet address
 export async function getUserDisplayName(walletAddress: string): Promise<string | null> {
   try {
@@ -54,52 +48,6 @@ export async function getUserDisplayName(walletAddress: string): Promise<string 
     return null;
   } catch (error) {
     Logger.info('Error fetching user display name:', error);
-    return null;
-  }
-}
-
-// Helper function to get or create user in Supabase
-async function getOrCreateUser(walletAddress: string, phoneNumber?: string, displayName?: string): Promise<string | null> {
-  try {
-    const authUserId = await getCurrentAuthUserId();
-
-    // Check if user exists
-    const { data: existingUser, error: fetchError } = await supabase
-      .from('users')
-      .select('id')
-      .eq('wallet_address', walletAddress)
-      .maybeSingle();
-
-    if (existingUser && !fetchError) {
-      return existingUser.id;
-    }
-
-    // Create new user
-    const verifiedEmail = await AsyncStorage.getItem('user_email');
-    const cpayId = walletAddress ? generateCPayId(verifiedEmail || phoneNumber || '', walletAddress) : null;
-
-    const { data: newUser, error: insertError } = await supabase
-      .from('users')
-      .insert({
-        auth_user_id: authUserId,
-        wallet_address: walletAddress,
-        email: verifiedEmail || null,
-        phone_number: phoneNumber || null,
-        display_name: displayName || null,
-        cpay_id: cpayId, // Save C-Pay ID to database
-      })
-      .select('id')
-      .single();
-
-    if (newUser && !insertError) {
-      Logger.info('✅ User created in Supabase:', newUser.id);
-      return newUser.id;
-    }
-
-    Logger.info('Error creating user:', insertError?.message);
-    return null;
-  } catch (error) {
-    Logger.info('Error in getOrCreateUser:', error);
     return null;
   }
 }

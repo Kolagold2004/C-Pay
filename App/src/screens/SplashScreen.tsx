@@ -39,11 +39,9 @@ export const SplashScreen: React.FC<SplashScreenProps> = ({ navigation }) => {
       Logger.info('Wallet exists:', walletExists);
       
       if (walletExists) {
-        const phoneVerified = await AsyncStorage.getItem('phone_number');
         const emailVerified = await AsyncStorage.getItem('email_verified');
-        const verificationComplete = Boolean(phoneVerified || emailVerified === 'true');
 
-        if (!verificationComplete) {
+        if (emailVerified !== 'true') {
           // Existing wallet but no active verification - show verification
           navigation.replace('EmailVerification');
         } else {
