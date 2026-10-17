@@ -154,12 +154,9 @@ export const ForgotPINScreen: React.FC<ForgotPINScreenProps> = ({ navigation }) 
         const walletAddress = await recreateWalletFromSecret(recoveredSecret, newPin);
         cachePinForSession(newPin);
 
-        const [email, phoneNumber] = await Promise.all([
-          AsyncStorage.getItem('user_email'),
-          AsyncStorage.getItem('phone_number'),
-        ]);
-        const displayId = email || phoneNumber
-          ? generateCPayId(email || phoneNumber || '', walletAddress)
+        const email = await AsyncStorage.getItem('user_email');
+        const displayId = email
+          ? generateCPayId(email, walletAddress)
           : formatWalletFingerprint(walletAddress);
 
         AlertManager.alert(

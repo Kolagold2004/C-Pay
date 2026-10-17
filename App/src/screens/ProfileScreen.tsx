@@ -46,6 +46,7 @@ export const ProfileScreen: React.FC<ProfileScreenProps> = ({ navigation }) => {
             await AsyncStorage.removeItem('auth_token');
             await AsyncStorage.removeItem('phone_verified');
             await AsyncStorage.removeItem('phone_number');
+            await AsyncStorage.removeItem('user_phone');
             await AsyncStorage.removeItem('email_verified');
             await AsyncStorage.removeItem('user_email');
             clearSessionPin();

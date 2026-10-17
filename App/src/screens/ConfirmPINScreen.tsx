@@ -30,7 +30,6 @@ const waitForUiPaint = () =>
 
 const saveInitialUserRecord = (
   walletAddress: string,
-  phoneNumber: string,
   cpayId: string
 ) => {
   void (async () => {
@@ -42,7 +41,6 @@ const saveInitialUserRecord = (
           {
             wallet_address: walletAddress,
             email: verifiedEmail || null,
-            phone_number: phoneNumber || null,
             cpay_id: cpayId,
             biometric_enabled: false,
           },
@@ -68,7 +66,7 @@ export const ConfirmPINScreen: React.FC<ConfirmPINScreenProps> = ({
   route,
 }) => {
   useTheme();
-  const { pin: originalPin, phoneNumber } = route.params;
+  const { pin: originalPin } = route.params;
   const [confirmPin, setConfirmPin] = useState('');
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
@@ -103,7 +101,7 @@ export const ConfirmPINScreen: React.FC<ConfirmPINScreenProps> = ({
 
       // Save wallet address locally for profile and optional biometric setup.
       const verifiedEmail = await AsyncStorage.getItem('user_email');
-      const cpayId = generateCPayId(verifiedEmail || phoneNumber || '', walletAddress);
+      const cpayId = generateCPayId(verifiedEmail || '', walletAddress);
       await Promise.all([
         AsyncStorage.setItem('wallet_address', walletAddress),
         AsyncStorage.setItem('cpay_id', cpayId),
@@ -112,12 +110,9 @@ export const ConfirmPINScreen: React.FC<ConfirmPINScreenProps> = ({
       cachePinForSession(originalPin);
 
       // Cloud save should not block local wallet creation or onboarding progress.
-      saveInitialUserRecord(walletAddress, phoneNumber || '', cpayId);
+      saveInitialUserRecord(walletAddress, cpayId);
 
-      navigation.replace('ProfileSetup', { 
-        walletAddress,
-        phoneNumber: phoneNumber || '',
-      });
+      navigation.replace('ProfileSetup', { walletAddress });
     } catch (err) {
       Logger.error('Wallet creation error:', err);
       AlertManager.alert('Error', 'Failed to create wallet. Please try again.');

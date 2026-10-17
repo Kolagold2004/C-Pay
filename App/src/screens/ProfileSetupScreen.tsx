@@ -30,7 +30,7 @@ interface ProfileSetupScreenProps {
 
 export const ProfileSetupScreen: React.FC<ProfileSetupScreenProps> = ({ navigation, route }) => {
   useTheme();
-  const { walletAddress, phoneNumber } = route.params;
+  const { walletAddress } = route.params;
   const [fullName, setFullName] = useState('');
   const [profilePhoto, setProfilePhoto] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
@@ -117,7 +117,6 @@ export const ProfileSetupScreen: React.FC<ProfileSetupScreenProps> = ({ navigati
 
   const completeProfileSetup = async (
     name: string,
-    phoneToSave: string | null,
     emailToSave: string | null,
     cpayId: string,
     photoUri: string | null
@@ -142,7 +141,6 @@ export const ProfileSetupScreen: React.FC<ProfileSetupScreenProps> = ({ navigati
           wallet_address: walletAddress,
           display_name: name,
           email: emailToSave,
-          phone_number: phoneToSave,
           cpay_id: cpayId,
           profile_photo_url: photoUrl,
         },
@@ -170,17 +168,10 @@ export const ProfileSetupScreen: React.FC<ProfileSetupScreenProps> = ({ navigati
       completingRef.current = true;
       setLoading(true);
 
-      // Check if phone number is development number
-      const isDevMode = process.env.EXPO_PUBLIC_DEV_MODE === 'true';
-      const devPhoneNumber = process.env.EXPO_PUBLIC_DEV_PHONE || '+911234567890';
-      const isDevPhone = isDevMode && phoneNumber === devPhoneNumber;
-      
-      // Email-only verification can continue without a phone number.
-      const phoneToSave = !phoneNumber || isDevPhone ? null : phoneNumber;
       const emailToSave = await AsyncStorage.getItem('user_email');
-      
+
       // Generate a public C-Pay ID for display and receiving payments.
-      const cpayId = generateCPayId(emailToSave || phoneToSave || phoneNumber || '', walletAddress);
+      const cpayId = generateCPayId(emailToSave || '', walletAddress);
 
       // Save locally
       const localWrites = [
@@ -195,14 +186,10 @@ export const ProfileSetupScreen: React.FC<ProfileSetupScreenProps> = ({ navigati
         localWrites.push(AsyncStorage.setItem('profile_photo', profilePhoto));
       }
 
-      if (phoneToSave) {
-        localWrites.push(AsyncStorage.setItem('phone_number', phoneNumber));
-      }
-
       await Promise.all(localWrites);
 
       // Complete profile upload/cloud save here so the next screen opens cleanly.
-      await completeProfileSetup(trimmedName, phoneToSave, emailToSave, cpayId, profilePhoto);
+      await completeProfileSetup(trimmedName, emailToSave, cpayId, profilePhoto);
 
       // Cloud backup protects the wallet before optional biometric setup.
       navigation.replace('CloudBackupSetup');
