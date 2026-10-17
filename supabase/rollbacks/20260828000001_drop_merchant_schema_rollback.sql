@@ -337,8 +337,18 @@ USING (
   )
 );
 
-GRANT EXECUTE ON FUNCTION get_public_merchant_by_id(UUID) TO authenticated;
-GRANT EXECUTE ON FUNCTION get_public_merchant_by_address(TEXT) TO authenticated;
-GRANT EXECUTE ON FUNCTION get_own_merchant_by_wallet(TEXT) TO authenticated;
+-- The rollback restores structure and data for service_role only (#125). No
+-- client code calls the merchant RPCs any more, so they are not re-granted, and
+-- the merchant tables (notably merchant_contact_verifications) stay client-
+-- unwritable. Supabase default privileges would otherwise grant both to anon
+-- and authenticated.
+REVOKE ALL ON FUNCTION get_public_merchant_by_id(UUID) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION get_public_merchant_by_address(TEXT) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION get_own_merchant_by_wallet(TEXT) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION refresh_merchant_totals(UUID) FROM PUBLIC, anon, authenticated;
+
+REVOKE ALL ON merchants FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON merchant_qr_codes FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON merchant_contact_verifications FROM PUBLIC, anon, authenticated;
 
 COMMIT;
