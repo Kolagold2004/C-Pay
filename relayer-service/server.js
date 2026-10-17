@@ -51,8 +51,20 @@ const quoteEngine = createQuoteEngine({
 const server = new StellarSdk.Horizon.Server(config.horizonUrl, {
   allowHttp: config.horizonUrl.startsWith('http://'),
 });
-const sponsorKeypair = StellarSdk.Keypair.fromSecret(config.sponsorSecret);
-const distributionKeypair = StellarSdk.Keypair.fromSecret(config.distributionSecret);
+const { KeyManager } = require('./keyManager');
+const keyManager = new KeyManager({
+  sponsorSecret: config.sponsorSecret,
+  distributionSecret: config.distributionSecret,
+  alertWebhookUrl: process.env.ALERT_WEBHOOK_URL,
+});
+const sponsorSigner = {
+  publicKey: () => keyManager.getSigner('sponsor').publicKey(),
+  sign: (tx) => keyManager.getSigner('sponsor').sign(tx),
+};
+const distributionSigner = {
+  publicKey: () => keyManager.getSigner('distribution').publicKey(),
+  sign: (tx) => keyManager.getSigner('distribution').sign(tx),
+};
 const usdcAsset = new StellarSdk.Asset(config.assetCode, config.assetIssuer);
 
 const { IngestWorker } = require('./ingestWorker');
@@ -139,8 +151,8 @@ app.post('/quotes/validate', requireAuthenticatedUser, (req, res) => {
 
 app.get('/health/detailed', requireAuthenticatedUser, async (_req, res) => {
   const [sponsorBalances, distributionBalances] = await Promise.all([
-    getBalances(sponsorKeypair.publicKey()),
-    getBalances(distributionKeypair.publicKey()),
+    getBalances(sponsorSigner.publicKey()),
+    getBalances(distributionSigner.publicKey()),
   ]);
 
   const sponsorXlm = Number(sponsorBalances.xlm || '0');
@@ -160,8 +172,8 @@ app.get('/health/detailed', requireAuthenticatedUser, async (_req, res) => {
     network: config.networkName,
     assetCode: config.assetCode,
     assetIssuer: config.assetIssuer,
-    sponsorPublicKey: sponsorKeypair.publicKey(),
-    distributionPublicKey: distributionKeypair.publicKey(),
+    sponsorPublicKey: sponsorSigner.publicKey(),
+    distributionPublicKey: distributionSigner.publicKey(),
     sponsorXlmBalance: sponsorBalances.xlm,
     distributionUsdcBalance: distributionBalances.asset,
     authRequired: config.authRequired,
@@ -258,11 +270,11 @@ app.post('/accounts/prepare', requireAuthenticatedUser, async (req, res) => {
     return res.json({
       alreadyReady: true,
       accountId,
-      sponsorPublicKey: sponsorKeypair.publicKey(),
+      sponsorPublicKey: sponsorSigner.publicKey(),
     });
   }
 
-  const sponsorAccount = await server.loadAccount(sponsorKeypair.publicKey());
+  const sponsorAccount = await server.loadAccount(sponsorSigner.publicKey());
   const builder = new StellarSdk.TransactionBuilder(sponsorAccount, {
     fee: config.baseFee,
     networkPassphrase: config.passphrase,
@@ -292,7 +304,7 @@ app.post('/accounts/prepare', requireAuthenticatedUser, async (req, res) => {
   const transaction = builder
     .setTimeout(config.transactionTimeoutSeconds)
     .build();
-  transaction.sign(sponsorKeypair);
+  sponsorSigner.sign(transaction);
 
   rememberPreparedAccountTransaction(req.auth?.sub || 'auth-disabled', transaction);
 
@@ -301,7 +313,7 @@ app.post('/accounts/prepare', requireAuthenticatedUser, async (req, res) => {
     accountId,
     xdr: transaction.toXDR(),
     networkPassphrase: config.passphrase,
-    sponsorPublicKey: sponsorKeypair.publicKey(),
+    sponsorPublicKey: sponsorSigner.publicKey(),
     requiresAccountSignature: true,
   });
 });
@@ -396,12 +408,12 @@ app.post('/payments/submit', requireAuthenticatedUser, requireWalletOwnership(),
 
   const maxFee = (BigInt(config.baseFee) * BigInt(config.feeBumpMultiplier)).toString();
   const feeBump = StellarSdk.TransactionBuilder.buildFeeBumpTransaction(
-    sponsorKeypair.publicKey(),
+    sponsorSigner.publicKey(),
     maxFee,
     innerTransaction,
     config.passphrase
   );
-  feeBump.sign(sponsorKeypair);
+  sponsorSigner.sign(feeBump);
 
   const result = await server.submitTransaction(feeBump);
 
@@ -517,7 +529,7 @@ app.post('/add-money', requireAuthenticatedUser, requireWalletOwnership('account
       });
     }
 
-    const distributionBalances = await getBalances(distributionKeypair.publicKey());
+    const distributionBalances = await getBalances(distributionSigner.publicKey());
     if (Number(distributionBalances.asset || '0') < Number(amount)) {
       return res.status(503).json({
         error: `Add Money is temporarily unavailable because the relayer distribution account has insufficient ${config.assetCode}.`,
@@ -538,7 +550,7 @@ app.post('/add-money', requireAuthenticatedUser, requireWalletOwnership('account
       nextAvailableAt,
     });
 
-    const distributionAccount = await server.loadAccount(distributionKeypair.publicKey());
+    const distributionAccount = await server.loadAccount(distributionSigner.publicKey());
     const tx = new StellarSdk.TransactionBuilder(distributionAccount, {
       fee: config.baseFee,
       networkPassphrase: config.passphrase,
@@ -552,7 +564,7 @@ app.post('/add-money', requireAuthenticatedUser, requireWalletOwnership('account
       .setTimeout(config.transactionTimeoutSeconds)
       .build();
 
-    tx.sign(distributionKeypair);
+    distributionSigner.sign(tx);
 
     const result = await server.submitTransaction(tx);
     const response = {
@@ -639,8 +651,8 @@ async function startRelayer() {
 
   console.log(`C-Pay Stellar relayer listening on port ${PORT}`);
   console.log(`Network: ${config.networkName}`);
-  console.log(`Sponsor: ${sponsorKeypair.publicKey()}`);
-  console.log(`Distribution: ${distributionKeypair.publicKey()}`);
+  console.log(`Sponsor: ${sponsorSigner.publicKey()}`);
+  console.log(`Distribution: ${distributionSigner.publicKey()}`);
 
   // Start ledger ingest worker on startup (non-blocking)
   if (config.ledgerIngestEnabled && ingestWorker.isConfigured) {
@@ -673,8 +685,10 @@ module.exports = {
   },
   startupPromise,
   ingestWorker,
+  keyManager,
   ...(process.env.NODE_ENV === 'test' ? {
     testHooks: Object.freeze({
+      keyManager,
       stellarServer: server,
       acquireAddMoneyUserLock,
       releaseAddMoneyUserLock,
@@ -926,7 +940,7 @@ async function bindWalletToUser(authUserId, walletAddress) {
  */
 async function checkSponsorBalanceAlarm() {
   try {
-    const balances = await getBalances(sponsorKeypair.publicKey());
+    const balances = await getBalances(sponsorSigner.publicKey());
     const sponsorXlm = Number(balances.xlm || '0');
     if (sponsorXlm < config.lowXlmThreshold) {
       console.warn(`[SPONSOR_DRAIN_ALARM] Sponsor account XLM balance is low: ${sponsorXlm} XLM (threshold: ${config.lowXlmThreshold})`);
@@ -1912,8 +1926,8 @@ async function sendLowBalanceAlert({ sponsorXlm, distributionAsset, lowXlm, lowA
       service: 'cpay-stellar-relayer',
       network: config.networkName,
       warnings,
-      sponsorPublicKey: sponsorKeypair.publicKey(),
-      distributionPublicKey: distributionKeypair.publicKey(),
+      sponsorPublicKey: sponsorSigner.publicKey(),
+      distributionPublicKey: distributionSigner.publicKey(),
       timestamp: new Date().toISOString(),
     }),
   });
