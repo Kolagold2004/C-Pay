@@ -101,24 +101,11 @@ app.use(limiter);
 app.get('/', (_req, res) => {
   res.json({
     service: 'C-Pay Stellar Relayer',
-    status: 'running',
     health: '/health',
-    endpoints: [
-      'GET /health',
-      'GET /health/detailed',
-      'GET /account/:accountId/status',
-      'GET /account/:accountId/balance',
-      'POST /accounts/prepare',
-      'POST /accounts/submit',
-      'POST /payments/submit',
-      'POST /add-money',
-      'GET /tx/:hash',
-      'GET /ingest/health',
-    ],
   });
 });
 
-app.get('/ingest/health', (_req, res) => {
+app.get('/ingest/health', requireAuthenticatedUser, (_req, res) => {
   res.json(ingestWorker.getHealth());
 });
 
@@ -587,7 +574,15 @@ app.post('/add-money', requireAuthenticatedUser, requireWalletOwnership('account
   }
 });
 
-app.get('/tx/:hash', async (req, res) => {
+const txLimiter = rateLimit({
+  windowMs: Number(process.env.TX_RATE_LIMIT_WINDOW_MS || 60000),
+  max: Number(process.env.TX_RATE_LIMIT_MAX_REQUESTS || 30),
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many transaction status requests, please try again later' },
+});
+
+app.get('/tx/:hash', requireAuthenticatedUser, txLimiter, async (req, res) => {
   const hash = normalizeOptionalString(req.params.hash);
   if (!hash || !/^[a-fA-F0-9]{64}$/.test(hash)) {
     return res.status(400).json({ error: 'Invalid transaction hash' });

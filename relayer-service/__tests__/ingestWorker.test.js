@@ -418,5 +418,30 @@ describe('IngestWorker', () => {
     expect(patchReq.body.internal_status).toBe('failed');
     expect(patchReq.body.failure_reason).toContain('not found on chain');
   });
+
+  test('sanitizes PostgREST and database error bodies into error classification', async () => {
+    const worker = new IngestWorker({
+      supabaseUrl: MOCK_SUPABASE_URL,
+      supabaseServiceRoleKey: MOCK_SERVICE_ROLE_KEY,
+      fetch: async () => ({
+        ok: false,
+        status: 400,
+        text: async () => JSON.stringify({
+          code: '42P01',
+          message: 'relation "public.transactions" does not exist',
+          details: 'table public.transactions missing',
+        }),
+      }),
+    });
+
+    try {
+      await worker.refreshWalletCache();
+    } catch (_) {}
+
+    const health = worker.getHealth();
+    expect(health.metrics.lastError).toBe('DATABASE_ERROR');
+    expect(health.metrics.lastError).not.toContain('transactions');
+    expect(health.metrics.lastError).not.toContain('42P01');
+  });
 });
 
