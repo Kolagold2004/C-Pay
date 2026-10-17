@@ -20,7 +20,13 @@ import { getAuthenticatedWallet } from '../utils/biometric';
 import { getTransactions, saveTransaction, Transaction, storageEvents } from '../services/storage';
 import { supabase } from '../services/supabase';
 import { COLORS, SPACING, FONT_SIZES, BORDER_RADIUS, SHADOWS, createThemedStyles, useTheme } from '../constants/theme';
-import { MONEY_BALANCE_LABEL, MONEY_SYMBOL, formatMoneyAmount } from '../utils/currency';
+import {
+  MONEY_BALANCE_LABEL,
+  MONEY_SYMBOL,
+  MONEY_UNIT_LABEL,
+  formatMoneyAmount,
+  formatMoneyBalance,
+} from '../utils/currency';
 import { PILOT_NOTICE_TEXT, PILOT_NOTICE_TITLE } from '../utils/pilot';
 import { usePaymentIntent } from '../hooks/usePaymentIntent';
 import {
