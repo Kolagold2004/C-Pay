@@ -105,7 +105,7 @@ class KeyManager {
       timestamp: new Date().toISOString(),
     };
     this.activityLog.push(logEntry);
-    console.log(`[KEY_CUSTODY] Key rotated successfully for role: ${role}`, logEntry);
+    console.log(`[KEY_CUSTODY] Key rotated successfully for role: ${role}`);
 
     this.sendAlert({
       event: 'KEY_ROTATED',

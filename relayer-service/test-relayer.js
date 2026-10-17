@@ -19,19 +19,16 @@ async function main() {
   console.log('Health:', {
     status: health.status,
     network: health.network,
-    sponsor: health.sponsorPublicKey,
-    sponsorXlmBalance: health.sponsorXlmBalance,
-    distributionUsdcBalance: health.distributionUsdcBalance,
   });
 
   if (TEST_ACCOUNT) {
     const status = await request(`/account/${TEST_ACCOUNT}/status`);
-    console.log('Account status:', status);
+    console.log('Account status check completed');
 
     const balance = await request(`/account/${TEST_ACCOUNT}/balance`);
-    console.log('Account balance:', balance);
+    console.log('Account balance check completed');
   } else {
-    console.log('Set TEST_STELLAR_ACCOUNT=G... to test account status and balance endpoints.');
+    console.log('Test account not provided. Skipping account endpoints.');
   }
 }
 

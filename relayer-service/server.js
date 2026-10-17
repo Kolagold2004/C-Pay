@@ -635,8 +635,8 @@ app.use((error, _req, res, _next) => {
 
   if (status >= 500) {
     console.error('Relayer error:', {
-      message: error.message,
-      response: error.response?.data,
+      classification: code || 'INTERNAL_ERROR',
+      status,
     });
   }
 
@@ -664,8 +664,6 @@ async function startRelayer() {
 
   console.log(`C-Pay Stellar relayer listening on port ${PORT}`);
   console.log(`Network: ${config.networkName}`);
-  console.log(`Sponsor: ${sponsorSigner.publicKey()}`);
-  console.log(`Distribution: ${distributionSigner.publicKey()}`);
 
   // Start ledger ingest worker on startup (non-blocking)
   if (config.ledgerIngestEnabled && ingestWorker.isConfigured) {
@@ -962,7 +960,7 @@ async function checkSponsorBalanceAlarm() {
     const balances = await getBalances(sponsorSigner.publicKey());
     const sponsorXlm = Number(balances.xlm || '0');
     if (sponsorXlm < config.lowXlmThreshold) {
-      console.warn(`[SPONSOR_DRAIN_ALARM] Sponsor account XLM balance is low: ${sponsorXlm} XLM (threshold: ${config.lowXlmThreshold})`);
+      console.warn('[SPONSOR_DRAIN_ALARM] Sponsor account XLM balance is low');
       if (typeof sendLowBalanceAlert === 'function') {
         if (await shouldSendLowBalanceAlert()) {
           sendLowBalanceAlert({ sponsorXlm, distributionAsset: null, lowXlm: true, lowAsset: false }).catch(() => {});
@@ -1905,10 +1903,6 @@ async function supabaseRestRequest(path, options = {}) {
     throw new Error('Supabase returned a non-JSON response');
   }
   return body;
-}
-
-function delay(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 function getStellarErrorMessage(resultCodes) {

@@ -59,7 +59,6 @@ export const TransactionHistoryScreen: React.FC<TransactionHistoryScreenProps> =
     }
 
     // Subscribe to real-time updates from Supabase
-// [SECURITY] Removed sensitive log: console.log('📡 Subscribing to real-time transaction updates...');
     
     const channel = supabase
       .channel('transactions_channel')
@@ -71,7 +70,6 @@ export const TransactionHistoryScreen: React.FC<TransactionHistoryScreenProps> =
           table: 'transactions' 
         },
         (payload) => {
-// [SECURITY] Removed sensitive log: console.log('🆕 New transaction received:', payload.new);
           setTransactions((prev) => [payload.new as Transaction, ...prev]);
         }
       )
@@ -83,7 +81,6 @@ export const TransactionHistoryScreen: React.FC<TransactionHistoryScreenProps> =
           table: 'transactions' 
         },
         (payload) => {
-// [SECURITY] Removed sensitive log: console.log('🔄 Transaction updated:', payload.new);
           setTransactions((prev) =>
             prev.map((tx) =>
               tx.tx_hash === (payload.new as Transaction).tx_hash
@@ -114,7 +111,6 @@ export const TransactionHistoryScreen: React.FC<TransactionHistoryScreenProps> =
   // Refresh transactions when screen comes into focus
   useFocusEffect(
     React.useCallback(() => {
-// [SECURITY] Removed sensitive log: console.log('🔄 TransactionHistory focused - refreshing');
       loadTransactions();
     }, [])
   );
@@ -131,7 +127,6 @@ export const TransactionHistoryScreen: React.FC<TransactionHistoryScreenProps> =
       const txs = await getTransactions();
       setTransactions(txs);
     } catch (error) {
-// [SECURITY] Removed sensitive log: console.error('Error loading transactions:', error);
     } finally {
       setLoading(false);
     }
@@ -144,7 +139,6 @@ export const TransactionHistoryScreen: React.FC<TransactionHistoryScreenProps> =
     await loadTransactions();
     
     // Manually poll pending transactions to update their status
-// [SECURITY] Removed sensitive log: console.log('🔄 Manual refresh: checking pending transactions...');
     await pollPendingTransactions();
     
     setRefreshing(false);

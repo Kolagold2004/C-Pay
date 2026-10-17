@@ -170,7 +170,6 @@ export const ForgotPINScreen: React.FC<ForgotPINScreenProps> = ({ navigation }) 
           ]
         );
       } catch (error: any) {
-// [SECURITY] Removed sensitive log: console.error('PIN reset error:', error);
         AlertManager.alert('Error', 'Failed to reset PIN. Please try again.');
         setStep('new-pin');
         setNewPin('');
