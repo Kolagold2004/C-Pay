@@ -67,10 +67,27 @@ const ingestWorker = new IngestWorker({
   startCursor: config.ingestStartCursor,
 });
 
-let lowBalanceAlertSent = false;
+/**
+ * Persisted low-balance alert deduplication.
+ * Eviction & deduplication policy:
+ * - Alerts are deduplicated across all relayer instances using relayer_idempotency_keys.
+ * - Alert window TTL: LOW_BALANCE_ALERT_WINDOW_MS (default: 1 hour).
+ * - Fires at most once per window across all instances.
+ * - Automatically reset when balances recover above threshold.
+ */
+const LOW_BALANCE_ALERT_WINDOW_MS = Number(process.env.LOW_BALANCE_ALERT_WINDOW_MS || 60 * 60 * 1000);
+let localLowBalanceAlertUntil = 0;
+
+/**
+ * Bounded cache for prepared account transactions.
+ * Eviction policy:
+ * - Time-To-Live (TTL): 5 minutes (PREPARED_ACCOUNT_TRANSACTION_TTL_MS).
+ * - Maximum capacity: 10,000 entries (MAX_PREPARED_ACCOUNT_TRANSACTIONS).
+ * - FIFO eviction: Oldest entries evicted when capacity is reached.
+ */
 const PREPARED_ACCOUNT_TRANSACTION_TTL_MS = 5 * 60 * 1000;
 const MAX_PREPARED_ACCOUNT_TRANSACTIONS = 10000;
-const preparedAccountTransactions = new Map();
+const preparedAccountTransactions = Object.create(null);
 
 app.use(helmet());
 app.use(cors({ origin: parseCorsOrigin(process.env.CORS_ORIGIN || '*') }));
@@ -148,11 +165,12 @@ app.get('/health/detailed', requireAuthenticatedUser, async (_req, res) => {
   const lowXlm = sponsorXlm < config.lowXlmThreshold;
   const lowAsset = distributionAsset < config.lowAssetThreshold;
 
-  if ((lowXlm || lowAsset) && !lowBalanceAlertSent) {
-    await sendLowBalanceAlert({ sponsorXlm, distributionAsset, lowXlm, lowAsset });
-    lowBalanceAlertSent = true;
-  } else if (!lowXlm && !lowAsset) {
-    lowBalanceAlertSent = false;
+  if (lowXlm || lowAsset) {
+    if (await shouldSendLowBalanceAlert()) {
+      await sendLowBalanceAlert({ sponsorXlm, distributionAsset, lowXlm, lowAsset });
+    }
+  } else {
+    await resetLowBalanceAlert();
   }
 
   res.json({
@@ -688,6 +706,12 @@ module.exports = {
       getPaymentLimitsStatus,
       recordPaymentRecord,
       inMemoryPaymentRecords,
+      shouldSendLowBalanceAlert,
+      resetLowBalanceAlert,
+      preparedAccountTransactions,
+      prunePreparedAccountTransactions,
+      activeAddMoneyUserLocks,
+      pruneActiveAddMoneyUserLocks,
     }),
   } : {}),
 };
@@ -931,7 +955,9 @@ async function checkSponsorBalanceAlarm() {
     if (sponsorXlm < config.lowXlmThreshold) {
       console.warn(`[SPONSOR_DRAIN_ALARM] Sponsor account XLM balance is low: ${sponsorXlm} XLM (threshold: ${config.lowXlmThreshold})`);
       if (typeof sendLowBalanceAlert === 'function') {
-        sendLowBalanceAlert({ sponsorXlm, distributionAsset: null, lowXlm: true, lowAsset: false }).catch(() => {});
+        if (await shouldSendLowBalanceAlert()) {
+          sendLowBalanceAlert({ sponsorXlm, distributionAsset: null, lowXlm: true, lowAsset: false }).catch(() => {});
+        }
       }
     }
   } catch (err) {
@@ -957,16 +983,18 @@ function serializeDecoratedSignature(signature) {
 }
 
 function prunePreparedAccountTransactions(now = Date.now()) {
-  for (const [key, prepared] of preparedAccountTransactions) {
+  for (const [key, prepared] of Object.entries(preparedAccountTransactions)) {
     if (prepared.expiresAt <= now) {
-      preparedAccountTransactions.delete(key);
+      delete preparedAccountTransactions[key];
     }
   }
 
-  while (preparedAccountTransactions.size > MAX_PREPARED_ACCOUNT_TRANSACTIONS) {
-    const oldestKey = preparedAccountTransactions.keys().next().value;
-    if (!oldestKey) break;
-    preparedAccountTransactions.delete(oldestKey);
+  const keys = Object.keys(preparedAccountTransactions);
+  if (keys.length > MAX_PREPARED_ACCOUNT_TRANSACTIONS) {
+    const excess = keys.length - MAX_PREPARED_ACCOUNT_TRANSACTIONS;
+    for (let i = 0; i < excess; i++) {
+      delete preparedAccountTransactions[keys[i]];
+    }
   }
 }
 
@@ -981,12 +1009,12 @@ function rememberPreparedAccountTransaction(authUid, transaction) {
   const key = preparedAccountTransactionKey(authUid, transactionHash);
   const now = Date.now();
   prunePreparedAccountTransactions(now);
-  preparedAccountTransactions.set(key, {
+  preparedAccountTransactions[key] = {
     key,
     expiresAt: now + PREPARED_ACCOUNT_TRANSACTION_TTL_MS,
     sponsorSignature,
     inFlight: false,
-  });
+  };
   prunePreparedAccountTransactions(now);
 }
 
@@ -994,7 +1022,7 @@ function getPreparedAccountTransaction(authUid, transaction) {
   prunePreparedAccountTransactions();
   const transactionHash = transaction.hash().toString('hex');
   const key = preparedAccountTransactionKey(authUid, transactionHash);
-  const prepared = preparedAccountTransactions.get(key);
+  const prepared = preparedAccountTransactions[key];
   if (!prepared) return null;
 
   const hasUnchangedSponsorSignature = transaction.signatures.some(signature => {
@@ -1300,16 +1328,35 @@ async function getAccountStatus(accountId) {
   }
 }
 
+/**
+ * In-memory fallback lock for Add Money claims when Supabase is not configured.
+ * Eviction policy:
+ * - TTL: Lock TTL (transactionTimeoutSeconds * 1000 + 5000).
+ * - Capacity: Max 1,000 concurrent user locks (MAX_ACTIVE_ADD_MONEY_USER_LOCKS).
+ * - Eviction: Expired entries are pruned on every acquisition; oldest entries evicted if capacity exceeded.
+ */
+const MAX_ACTIVE_ADD_MONEY_USER_LOCKS = 1000;
 const activeAddMoneyUserLocks = Object.create(null);
+
+function pruneActiveAddMoneyUserLocks(now = Date.now()) {
+  for (const [key, expiry] of Object.entries(activeAddMoneyUserLocks)) {
+    if (expiry <= now) {
+      delete activeAddMoneyUserLocks[key];
+    }
+  }
+  const keys = Object.keys(activeAddMoneyUserLocks);
+  if (keys.length > MAX_ACTIVE_ADD_MONEY_USER_LOCKS) {
+    const excess = keys.length - MAX_ACTIVE_ADD_MONEY_USER_LOCKS;
+    for (let i = 0; i < excess; i++) {
+      delete activeAddMoneyUserLocks[keys[i]];
+    }
+  }
+}
 
 async function acquireAddMoneyUserLock(userLockKey, ttlMs) {
   const now = Date.now();
-  const existingExpiry = activeAddMoneyUserLocks[userLockKey];
-  if (existingExpiry && existingExpiry > now) {
-    return { acquired: false };
-  }
-  activeAddMoneyUserLocks[userLockKey] = now + ttlMs;
 
+  // If Supabase persistence is enabled, the database is the distributed authority across instances.
   if (isSupabasePersistenceEnabled()) {
     try {
       await supabaseRestRequest('relayer_idempotency_keys', {
@@ -1321,14 +1368,50 @@ async function acquireAddMoneyUserLock(userLockKey, ttlMs) {
           expires_at: new Date(now + ttlMs).toISOString(),
         }),
       });
+      activeAddMoneyUserLocks[userLockKey] = now + ttlMs;
+      pruneActiveAddMoneyUserLocks(now);
+      return { acquired: true };
     } catch (error) {
-      if (error?.message?.includes('409') || error?.status === 409 || error?.response?.status === 409) {
-        delete activeAddMoneyUserLocks[userLockKey];
+      if (isPostgresUniqueViolation(error)) {
+        // Lock already held by this or another instance. Check for expiry.
+        try {
+          const query = new URLSearchParams({ select: 'expires_at', key: `eq.${userLockKey}`, limit: '1' });
+          const rows = await supabaseRestRequest(`relayer_idempotency_keys?${query.toString()}`, {
+            method: 'GET',
+            headers: { Accept: 'application/json' },
+          });
+          if (Array.isArray(rows) && rows.length > 0 && rows[0].expires_at) {
+            const expiresAt = new Date(rows[0].expires_at).getTime();
+            if (expiresAt <= now) {
+              // Lock expired: renew it and acquire
+              const patchQuery = new URLSearchParams({ key: `eq.${userLockKey}` });
+              await supabaseRestRequest(`relayer_idempotency_keys?${patchQuery.toString()}`, {
+                method: 'PATCH',
+                headers: { Prefer: 'return=minimal' },
+                body: JSON.stringify({
+                  expires_at: new Date(now + ttlMs).toISOString(),
+                }),
+              });
+              activeAddMoneyUserLocks[userLockKey] = now + ttlMs;
+              pruneActiveAddMoneyUserLocks(now);
+              return { acquired: true };
+            }
+          }
+        } catch {}
         return { acquired: false };
       }
+      throw createAddMoneyPersistenceError(error, 'lock acquisition');
     }
-    throw createAddMoneyPersistenceError(error, 'lock acquisition');
   }
+
+  // Fallback when Supabase persistence is not configured
+  pruneActiveAddMoneyUserLocks(now);
+  const existingExpiry = activeAddMoneyUserLocks[userLockKey];
+  if (existingExpiry && existingExpiry > now) {
+    return { acquired: false };
+  }
+  activeAddMoneyUserLocks[userLockKey] = now + ttlMs;
+  return { acquired: true };
 }
 
 async function releaseAddMoneyUserLock(userLockKey) {
@@ -1918,3 +2001,72 @@ async function sendLowBalanceAlert({ sponsorXlm, distributionAsset, lowXlm, lowA
     }),
   });
 }
+
+const LOW_BALANCE_ALERT_KEY = 'alert:low-balance';
+
+async function shouldSendLowBalanceAlert() {
+  const now = Date.now();
+  if (isSupabasePersistenceEnabled()) {
+    try {
+      const expiresAt = new Date(now + LOW_BALANCE_ALERT_WINDOW_MS).toISOString();
+      await supabaseRestRequest('relayer_idempotency_keys', {
+        method: 'POST',
+        headers: { Prefer: 'return=minimal' },
+        body: JSON.stringify({
+          key: LOW_BALANCE_ALERT_KEY,
+          response: { alertedAt: new Date(now).toISOString() },
+          expires_at: expiresAt,
+        }),
+      });
+      localLowBalanceAlertUntil = now + LOW_BALANCE_ALERT_WINDOW_MS;
+      return true;
+    } catch (error) {
+      if (isPostgresUniqueViolation(error)) {
+        try {
+          const query = new URLSearchParams({ select: 'expires_at', key: `eq.${LOW_BALANCE_ALERT_KEY}`, limit: '1' });
+          const rows = await supabaseRestRequest(`relayer_idempotency_keys?${query.toString()}`, {
+            method: 'GET',
+            headers: { Accept: 'application/json' },
+          });
+          if (Array.isArray(rows) && rows.length > 0 && rows[0].expires_at) {
+            const exp = new Date(rows[0].expires_at).getTime();
+            if (exp <= now) {
+              const patchQuery = new URLSearchParams({ key: `eq.${LOW_BALANCE_ALERT_KEY}` });
+              await supabaseRestRequest(`relayer_idempotency_keys?${patchQuery.toString()}`, {
+                method: 'PATCH',
+                headers: { Prefer: 'return=minimal' },
+                body: JSON.stringify({
+                  expires_at: new Date(now + LOW_BALANCE_ALERT_WINDOW_MS).toISOString(),
+                  response: { alertedAt: new Date(now).toISOString() },
+                }),
+              });
+              localLowBalanceAlertUntil = now + LOW_BALANCE_ALERT_WINDOW_MS;
+              return true;
+            }
+          }
+        } catch {}
+        return false;
+      }
+    }
+  }
+
+  if (localLowBalanceAlertUntil > now) {
+    return false;
+  }
+  localLowBalanceAlertUntil = now + LOW_BALANCE_ALERT_WINDOW_MS;
+  return true;
+}
+
+async function resetLowBalanceAlert() {
+  localLowBalanceAlertUntil = 0;
+  if (isSupabasePersistenceEnabled()) {
+    try {
+      const query = new URLSearchParams({ key: `eq.${LOW_BALANCE_ALERT_KEY}` });
+      await supabaseRestRequest(`relayer_idempotency_keys?${query.toString()}`, {
+        method: 'DELETE',
+        headers: { Prefer: 'return=minimal' },
+      });
+    } catch {}
+  }
+}
+

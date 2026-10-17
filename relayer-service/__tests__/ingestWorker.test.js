@@ -1,6 +1,6 @@
 'use strict';
 
-const { IngestWorker, DEFAULT_CURSOR_KEY } = require('../ingestWorker');
+const { IngestWorker, BoundedLruMap, DEFAULT_CURSOR_KEY } = require('../ingestWorker');
 
 function makeResponse(ok, status, data) {
   const body = JSON.stringify(data);
@@ -417,6 +417,89 @@ describe('IngestWorker', () => {
     expect(patchReq.body.status).toBe('failed');
     expect(patchReq.body.internal_status).toBe('failed');
     expect(patchReq.body.failure_reason).toContain('not found on chain');
+  });
+
+  test('BoundedLruMap bounds capacity and evicts least recently used items', () => {
+    const lru = new BoundedLruMap(2);
+    lru.set('addr1', 'u1');
+    lru.set('addr2', 'u2');
+    expect(lru.size).toBe(2);
+    expect(lru.get('addr1')).toBe('u1'); // Promote addr1
+    lru.set('addr3', 'u3'); // Should evict addr2
+    expect(lru.size).toBe(2);
+    expect(lru.get('addr2')).toBeUndefined();
+    expect(lru.get('addr1')).toBe('u1');
+    expect(lru.get('addr3')).toBe('u3');
+  });
+
+  test('resolves un-cached wallet address on demand via getUserIdForWallet', async () => {
+    const worker = new IngestWorker({
+      supabaseUrl: MOCK_SUPABASE_URL,
+      supabaseServiceRoleKey: MOCK_SERVICE_ROLE_KEY,
+      fetch: mockFetch,
+    });
+
+    const userId = await worker.getUserIdForWallet('GAKNOWN_WALLET_1');
+    expect(userId).toBe('user-1-uid');
+    expect(worker.walletUserCache.get('GAKNOWN_WALLET_1')).toBe('user-1-uid');
+  });
+
+  test('enforces active-standby leader election across worker instances', async () => {
+    let leaseStore = [];
+    const leaderFetch = jest.fn(async (url, options = {}) => {
+      const urlStr = String(url);
+      const method = options.method || 'GET';
+      if (urlStr.includes('/rest/v1/ingest_state')) {
+        if (method === 'GET') {
+          return makeResponse(true, 200, leaseStore);
+        }
+        if (method === 'POST') {
+          const body = JSON.parse(options.body);
+          leaseStore = [{ ...body }];
+          return makeResponse(true, 200, leaseStore);
+        }
+        if (method === 'DELETE') {
+          leaseStore = [];
+          return makeResponse(true, 200, []);
+        }
+      }
+      return makeResponse(true, 200, []);
+    });
+
+    const worker1 = new IngestWorker({
+      workerId: 'worker-instance-1',
+      supabaseUrl: MOCK_SUPABASE_URL,
+      supabaseServiceRoleKey: MOCK_SERVICE_ROLE_KEY,
+      fetch: leaderFetch,
+      leaderLeaseTtlMs: 30000,
+    });
+
+    const worker2 = new IngestWorker({
+      workerId: 'worker-instance-2',
+      supabaseUrl: MOCK_SUPABASE_URL,
+      supabaseServiceRoleKey: MOCK_SERVICE_ROLE_KEY,
+      fetch: leaderFetch,
+      leaderLeaseTtlMs: 30000,
+    });
+
+    // worker1 claims leadership
+    const isLeader1 = await worker1.acquireOrRenewLeaderLease();
+    expect(isLeader1).toBe(true);
+    expect(worker1.isLeader).toBe(true);
+
+    // worker2 attempts to acquire, sees active lease from worker1 -> standby
+    const isLeader2 = await worker2.acquireOrRenewLeaderLease();
+    expect(isLeader2).toBe(false);
+    expect(worker2.isLeader).toBe(false);
+
+    // worker1 stops and releases lease
+    await worker1.stop();
+    expect(worker1.isLeader).toBe(false);
+
+    // worker2 can now acquire leadership
+    const isLeader2After = await worker2.acquireOrRenewLeaderLease();
+    expect(isLeader2After).toBe(true);
+    expect(worker2.isLeader).toBe(true);
   });
 });
 

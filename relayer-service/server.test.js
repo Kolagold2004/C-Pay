@@ -152,7 +152,7 @@ function buildFetchMock({
 
       if (method === 'GET') {
         const row = persistence.locks.get(key);
-        return makeResponse(true, 200, row ? [{ response: row.response }] : []);
+        return makeResponse(true, 200, row ? [{ response: row.response, expires_at: row.expires_at }] : []);
       }
 
       if (method === 'PATCH') {
@@ -1106,6 +1106,129 @@ describe('Payment transaction limits and velocity enforcement (#114)', () => {
       statusCode: 429,
       code: 'PAYMENT_DAILY_CAP_EXCEEDED',
     });
+  });
+});
+
+describe('Multi-instance coordination and bounded memory state', () => {
+  let sharedPersistence;
+  let instance1;
+  let instance2;
+
+  beforeEach(async () => {
+    sharedPersistence = {
+      locks: new Map(),
+      claims: [],
+      paymentRecords: [],
+    };
+
+    instance1 = await loadServerModule({
+      __fetchMock: buildFetchMock({
+        userWallets: { [USER_A]: [WALLET_A] },
+        walletOwners: { [WALLET_A]: USER_A },
+        database: sharedPersistence,
+      }),
+    });
+
+    instance2 = await loadServerModule({
+      __fetchMock: buildFetchMock({
+        userWallets: { [USER_A]: [WALLET_A] },
+        walletOwners: { [WALLET_A]: USER_A },
+        database: sharedPersistence,
+      }),
+    });
+  });
+
+  afterEach(async () => {
+    await closeActiveModuleServers();
+  });
+
+  it('two relayer instances serialize Add Money requests identically to one', async () => {
+    const userLockKey = `add-money-user:${USER_A}`;
+
+    // Instance 1 acquires lock for USER_A
+    const res1 = await instance1.testHooks.acquireAddMoneyUserLock(userLockKey, 60000);
+    expect(res1).toEqual({ acquired: true });
+
+    // Instance 2 attempts to acquire lock for same user concurrently -> rejected
+    const res2 = await instance2.testHooks.acquireAddMoneyUserLock(userLockKey, 60000);
+    expect(res2).toEqual({ acquired: false });
+
+    // Instance 1 releases lock
+    await instance1.testHooks.releaseAddMoneyUserLock(userLockKey);
+
+    // Instance 2 can now acquire lock
+    const res3 = await instance2.testHooks.acquireAddMoneyUserLock(userLockKey, 60000);
+    expect(res3).toEqual({ acquired: true });
+  });
+
+  it('an expired user lock held by another instance is reclaimed automatically', async () => {
+    const userLockKey = `add-money-user:${USER_A}`;
+
+    // Insert an expired lock directly into shared persistence
+    sharedPersistence.locks.set(userLockKey, {
+      key: userLockKey,
+      response: null,
+      expires_at: new Date(Date.now() - 5000).toISOString(),
+    });
+
+    // Instance 2 should detect expired lock and take it over
+    const res = await instance2.testHooks.acquireAddMoneyUserLock(userLockKey, 60000);
+    expect(res).toEqual({ acquired: true });
+  });
+
+  it('balance alerts fire once per window across instances and reset when balances recover', async () => {
+    // Instance 1 checks alert: fires and acquires window
+    const shouldAlert1 = await instance1.testHooks.shouldSendLowBalanceAlert();
+    expect(shouldAlert1).toBe(true);
+
+    // Instance 2 checks alert within same window: deduplicated across instances
+    const shouldAlert2 = await instance2.testHooks.shouldSendLowBalanceAlert();
+    expect(shouldAlert2).toBe(false);
+
+    // Balances recover: reset alert
+    await instance1.testHooks.resetLowBalanceAlert();
+
+    // After reset, a new alert can fire across instances
+    const shouldAlert3 = await instance2.testHooks.shouldSendLowBalanceAlert();
+    expect(shouldAlert3).toBe(true);
+  });
+
+  it('preparedAccountTransactions cache enforces max capacity and FIFO/TTL eviction', () => {
+    const { preparedAccountTransactions, prunePreparedAccountTransactions } = instance1.testHooks;
+
+    // Simulate expired entry
+    preparedAccountTransactions['expired-key'] = {
+      key: 'expired-key',
+      expiresAt: Date.now() - 1000,
+    };
+    prunePreparedAccountTransactions();
+    expect(preparedAccountTransactions['expired-key']).toBeUndefined();
+
+    // Test capacity bounding
+    for (let i = 0; i < 10005; i++) {
+      preparedAccountTransactions[`key-${i}`] = {
+        key: `key-${i}`,
+        expiresAt: Date.now() + 60000,
+      };
+    }
+    prunePreparedAccountTransactions();
+    expect(Object.keys(preparedAccountTransactions).length).toBeLessThanOrEqual(10000);
+  });
+
+  it('activeAddMoneyUserLocks in-memory fallback cache enforces max capacity and TTL eviction', () => {
+    const { activeAddMoneyUserLocks, pruneActiveAddMoneyUserLocks } = instance1.testHooks;
+
+    // Simulate expired fallback lock
+    activeAddMoneyUserLocks['expired-user'] = Date.now() - 1000;
+    pruneActiveAddMoneyUserLocks();
+    expect(activeAddMoneyUserLocks['expired-user']).toBeUndefined();
+
+    // Fill capacity
+    for (let i = 0; i < 1005; i++) {
+      activeAddMoneyUserLocks[`user-${i}`] = Date.now() + 60000;
+    }
+    pruneActiveAddMoneyUserLocks();
+    expect(Object.keys(activeAddMoneyUserLocks).length).toBeLessThanOrEqual(1000);
   });
 });
 

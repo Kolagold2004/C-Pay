@@ -51,13 +51,43 @@ retryable `503` and do not submit funds.
 - `POST /add-money`
 - `GET /tx/:hash`
 
-## Ledger Ingest Worker
+## Multi-Instance Architecture & Coordination
+
+The relayer is designed to run behind a load balancer with multiple concurrent instances behaving identically to one:
+
+1. **Distributed Add Money Lock**: Add Money requests are serialized across all instances via Supabase `relayer_idempotency_keys` (`key = add-money-user:${authUserId}`). Concurrent requests for the same user on different instances are rejected with `429 ADD_MONEY_IN_FLIGHT` via PostgreSQL unique constraint violation (`23505`). If an instance crashes while holding a lock, subsequent requests detect expired locks and assume ownership.
+2. **Cluster-Wide Alert Deduplication**: Low-balance alerts (`ALERT_WEBHOOK_URL`) use `relayer_idempotency_keys` (`key = alert:low-balance`) with a distributed TTL window (`LOW_BALANCE_ALERT_WINDOW_MS`, default: 1 hour). Alerts fire at most once per window across the entire cluster, survive restarts, and automatically reset when account balances recover above threshold.
+3. **Stateless Service**: `server.js` avoids unbounded module-level memory state. All caches are strictly bounded with explicit eviction policies.
+
+## In-Memory Cache Eviction Policies
+
+Every remaining in-memory cache is bounded with an explicit eviction policy:
+
+1. **`walletUserCache` (Ingest Worker)**:
+   - **Type**: `BoundedLruMap` (Least Recently Used).
+   - **Capacity**: Configurable via `INGEST_WALLET_CACHE_MAX_SIZE` (default: 5,000 entries).
+   - **Eviction**: When capacity is reached, the least recently accessed wallet mapping is evicted upon new insertion.
+   - **Resolution**: Initial cache pre-warming is capped at capacity limit; cache misses resolve on demand via `users` table queries and populate the LRU cache.
+2. **`preparedAccountTransactions` (Relayer Service)**:
+   - **Type**: Bounded TTL / FIFO Object map.
+   - **Capacity**: 10,000 entries (`MAX_PREPARED_ACCOUNT_TRANSACTIONS`).
+   - **TTL**: 5 minutes (`PREPARED_ACCOUNT_TRANSACTION_TTL_MS`).
+   - **Eviction**: Expired entries are pruned on every access; oldest entries are evicted if capacity exceeds 10,000.
+3. **`activeAddMoneyUserLocks` (In-Memory Fallback)**:
+   - **Type**: Bounded TTL / FIFO Object map (used only when Supabase persistence is not configured).
+   - **Capacity**: 1,000 entries (`MAX_ACTIVE_ADD_MONEY_USER_LOCKS`).
+   - **TTL**: Transaction timeout (`TRANSACTION_TIMEOUT_SECONDS * 1000 + 5000`).
+   - **Eviction**: Expired entries are pruned on every acquisition; oldest entries are evicted if capacity exceeds 1,000.
+
+## Ledger Ingest Worker Instance Model
 
 The Ingest Worker continuously streams/polls Horizon payment operations:
-1. **Resumable Ingestion**: Uses a cursor persisted in Supabase `ingest_state` table to resume without scanning from genesis.
-2. **Idempotency**: Upserts into `transactions` with key `(tx_hash, op_index)`. Replaying the same ledger range causes no duplicates.
-3. **Reconciliation**: Matches chain records against optimistic pending transactions and marks timed-out pending rows as failed.
-4. **Lag Metrics**: Calculates and exposes ledger lag (`latestNetworkLedger - lastIngestedLedger`) via `GET /ingest/health` and `GET /health`.
+1. **Active-Standby Leader Election**: Backed by `ingest_state` lease in Supabase (`key = ingest_leader`). Only the elected leader instance actively streams Horizon operations and advances the cursor, preventing split-brain cursor collisions or duplicate ingestion across multiple relayer instances. Standby instances monitor the lease heartbeat and automatically promote to leader if the current leader fails to renew within `INGEST_LEADER_LEASE_TTL_MS` (default: 30 seconds).
+2. **Deployment Modes**: In containerized deployments behind a load balancer, set `LEDGER_INGEST_ENABLED=false` on stateless web/API nodes and run a single dedicated background worker with `LEDGER_INGEST_ENABLED=true`. When running multiple instances with `LEDGER_INGEST_ENABLED=true`, the leader lease ensures only one active worker streams at a time.
+3. **Resumable Ingestion**: Uses a cursor persisted in Supabase `ingest_state` table to resume without scanning from genesis.
+4. **Idempotency**: Upserts into `transactions` with key `(tx_hash, op_index)`. Replaying the same ledger range causes no duplicates.
+5. **Reconciliation**: Matches chain records against optimistic pending transactions and marks timed-out pending rows as failed.
+6. **Lag Metrics**: Calculates and exposes ledger lag (`latestNetworkLedger - lastIngestedLedger`) via `GET /ingest/health` and `GET /health/detailed`.
 
 ## Production Notes
 
@@ -68,3 +98,4 @@ The Ingest Worker continuously streams/polls Horizon payment operations:
 - Rotate `SPONSOR_SECRET` and `DISTRIBUTION_SECRET` through infrastructure secrets.
 - Keep `ADD_MONEY_AMOUNT`, `MAX_PAYMENT_AMOUNT`, and `ADD_MONEY_COOLDOWN_MS` policy controlled.
 - Configure `ALERT_WEBHOOK_URL` for low XLM or low CPINR inventory alerts.
+
