@@ -219,57 +219,17 @@ app.get('/account/:accountId/balance', requireAuthenticatedUser, requirePathWall
   });
 });
 
-app.post('/accounts/prepare', requireAuthenticatedUser, async (req, res) => {
-  const accountId = assertAccountId(req.body.accountId, 'accountId');
+app.post(
+  '/accounts/prepare',
+  requireAuthenticatedUser,
+  requireAccountPreparationOwnership('accountId'),
+  async (req, res) => {
+    const accountId = assertAccountId(req.body.accountId, 'accountId');
 
-  if (config.authRequired) {
-    const authUid = req.auth && req.auth.sub;
-    if (!authUid) {
-      return res.status(401).json({
-        error: 'Authentication required',
-        code: 'AUTH_REQUIRED',
-      });
-    }
+    // Check sponsor balance alarm
+    checkSponsorBalanceAlarm().catch(() => {});
 
-    const ownerResult = await resolveWalletOwner(accountId);
-    if (!ownerResult.configured || !ownerResult.ok) {
-      return sendWalletOwnershipUnavailable(res, ownerResult.error);
-    }
-
-    if (ownerResult.owner && ownerResult.owner !== authUid) {
-      return res.status(403).json({
-        error: 'You are not authorized to prepare this wallet (already bound to another user)',
-        code: 'WALLET_OWNERSHIP_DENIED',
-      });
-    }
-
-    if (!ownerResult.owner) {
-      const walletsResult = await resolveUserWallets(authUid);
-      if (!walletsResult.configured || !walletsResult.ok) {
-        return sendWalletOwnershipUnavailable(res, walletsResult.error);
-      }
-
-      if (walletsResult.wallets.length >= config.maxSponsoredAccountsPerUser) {
-        return res.status(403).json({
-          error: `Maximum sponsored accounts limit (${config.maxSponsoredAccountsPerUser}) reached for this user`,
-          code: 'SPONSORSHIP_LIMIT_EXCEEDED',
-          maxAccounts: config.maxSponsoredAccountsPerUser,
-        });
-      }
-
-      try {
-        await bindWalletToUser(authUid, accountId);
-      } catch (error) {
-        console.error('Failed to bind wallet:', error.message);
-        return sendWalletOwnershipUnavailable(res, error, 'WALLET_BINDING_FAILED');
-      }
-    }
-  }
-
-  // Check sponsor balance alarm
-  checkSponsorBalanceAlarm().catch(() => {});
-
-  const status = await getAccountStatus(accountId);
+    const status = await getAccountStatus(accountId);
 
   if (status.exists && status.hasTrustline) {
     return res.json({
@@ -721,6 +681,7 @@ module.exports = {
       prunePreparedAccountTransactions,
       activeAddMoneyUserLocks,
       pruneActiveAddMoneyUserLocks,
+      requireAccountPreparationOwnership,
     }),
   } : {}),
 };
@@ -1114,6 +1075,70 @@ function requirePathWalletOwnership() {
         code: 'WALLET_OWNERSHIP_DENIED',
       });
     }
+    return next();
+  };
+}
+
+/**
+ * Middleware for /accounts/prepare.
+ * Enforces wallet ownership, uniqueness (cannot prepare wallet bound to another user),
+ * per-user sponsorship limits, and durable blocking binding.
+ */
+function requireAccountPreparationOwnership(walletField = 'accountId') {
+  return async function (req, res, next) {
+    let accountId;
+    try {
+      accountId = assertAccountId(req.body && req.body[walletField], walletField);
+    } catch (error) {
+      return res.status(400).json({ error: error.message });
+    }
+
+    if (!config.authRequired) {
+      return next();
+    }
+
+    const authUid = req.auth && req.auth.sub;
+    if (!authUid) {
+      return res.status(401).json({
+        error: 'Authentication required',
+        code: 'AUTH_REQUIRED',
+      });
+    }
+
+    const ownerResult = await resolveWalletOwner(accountId);
+    if (!ownerResult.configured || !ownerResult.ok) {
+      return sendWalletOwnershipUnavailable(res, ownerResult.error);
+    }
+
+    if (ownerResult.owner && ownerResult.owner !== authUid) {
+      return res.status(403).json({
+        error: 'You are not authorized to prepare this wallet (already bound to another user)',
+        code: 'WALLET_OWNERSHIP_DENIED',
+      });
+    }
+
+    if (!ownerResult.owner) {
+      const walletsResult = await resolveUserWallets(authUid);
+      if (!walletsResult.configured || !walletsResult.ok) {
+        return sendWalletOwnershipUnavailable(res, walletsResult.error);
+      }
+
+      if (walletsResult.wallets.length >= config.maxSponsoredAccountsPerUser) {
+        return res.status(403).json({
+          error: `Maximum sponsored accounts limit (${config.maxSponsoredAccountsPerUser}) reached for this user`,
+          code: 'SPONSORSHIP_LIMIT_EXCEEDED',
+          maxAccounts: config.maxSponsoredAccountsPerUser,
+        });
+      }
+
+      try {
+        await bindWalletToUser(authUid, accountId);
+      } catch (error) {
+        console.error('Failed to bind wallet:', error.message);
+        return sendWalletOwnershipUnavailable(res, error, 'WALLET_BINDING_FAILED');
+      }
+    }
+
     return next();
   };
 }
