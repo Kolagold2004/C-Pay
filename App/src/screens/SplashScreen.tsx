@@ -12,7 +12,7 @@ import {
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { hasWallet } from '../services/wallet';
-import { COLORS, SPACING, TYPOGRAPHY } from '../constants/theme';
+import { COLORS, SPACING, TYPOGRAPHY, createThemedStyles, useTheme } from '../constants/theme';
 import { PILOT_NOTICE_TITLE } from '../utils/pilot';
 
 const FONT_SIZES = TYPOGRAPHY.sizes;
@@ -71,7 +71,7 @@ export const SplashScreen: React.FC<SplashScreenProps> = ({ navigation }) => {
         <Text style={styles.subtitle}>{PILOT_NOTICE_TITLE} on Stellar testnet</Text>
       </View>
       <View style={styles.loadingContainer}>
-        <ActivityIndicator size="small" color={COLORS.card} />
+        <ActivityIndicator size="small" color={COLORS.textInverse} />
         <Text style={styles.loadingText}>Loading...</Text>
       </View>
     </View>
@@ -97,12 +97,12 @@ const styles = createThemedStyles((COLORS) => ({
   title: {
     fontSize: FONT_SIZES.xxl,
     fontWeight: 'bold',
-    color: COLORS.card,
+    color: COLORS.textInverse,
     marginBottom: SPACING.sm,
   },
   subtitle: {
     fontSize: FONT_SIZES.md,
-    color: COLORS.card + 'CC',
+    color: COLORS.textInverse + 'CC',
   },
   loadingContainer: {
     position: 'absolute',
@@ -111,7 +111,7 @@ const styles = createThemedStyles((COLORS) => ({
   },
   loadingText: {
     fontSize: FONT_SIZES.sm,
-    color: COLORS.card + 'AA',
+    color: COLORS.textInverse + 'AA',
     marginTop: SPACING.sm,
   },
 }));
