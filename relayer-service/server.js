@@ -67,6 +67,12 @@ const distributionSigner = {
 };
 const usdcAsset = new StellarSdk.Asset(config.assetCode, config.assetIssuer);
 
+const {
+  SupabaseRequestError,
+  executeSupabaseRequest,
+  isPostgresUniqueViolation,
+} = require('./supabaseRest');
+
 const { IngestWorker } = require('./ingestWorker');
 const ingestWorker = new IngestWorker({
   horizonUrl: config.horizonUrl,
@@ -219,57 +225,17 @@ app.get('/account/:accountId/balance', requireAuthenticatedUser, requirePathWall
   });
 });
 
-app.post('/accounts/prepare', requireAuthenticatedUser, async (req, res) => {
-  const accountId = assertAccountId(req.body.accountId, 'accountId');
+app.post(
+  '/accounts/prepare',
+  requireAuthenticatedUser,
+  requireAccountPreparationOwnership('accountId'),
+  async (req, res) => {
+    const accountId = assertAccountId(req.body.accountId, 'accountId');
 
-  if (config.authRequired) {
-    const authUid = req.auth && req.auth.sub;
-    if (!authUid) {
-      return res.status(401).json({
-        error: 'Authentication required',
-        code: 'AUTH_REQUIRED',
-      });
-    }
+    // Check sponsor balance alarm
+    checkSponsorBalanceAlarm().catch(() => {});
 
-    const ownerResult = await resolveWalletOwner(accountId);
-    if (!ownerResult.configured || !ownerResult.ok) {
-      return sendWalletOwnershipUnavailable(res, ownerResult.error);
-    }
-
-    if (ownerResult.owner && ownerResult.owner !== authUid) {
-      return res.status(403).json({
-        error: 'You are not authorized to prepare this wallet (already bound to another user)',
-        code: 'WALLET_OWNERSHIP_DENIED',
-      });
-    }
-
-    if (!ownerResult.owner) {
-      const walletsResult = await resolveUserWallets(authUid);
-      if (!walletsResult.configured || !walletsResult.ok) {
-        return sendWalletOwnershipUnavailable(res, walletsResult.error);
-      }
-
-      if (walletsResult.wallets.length >= config.maxSponsoredAccountsPerUser) {
-        return res.status(403).json({
-          error: `Maximum sponsored accounts limit (${config.maxSponsoredAccountsPerUser}) reached for this user`,
-          code: 'SPONSORSHIP_LIMIT_EXCEEDED',
-          maxAccounts: config.maxSponsoredAccountsPerUser,
-        });
-      }
-
-      try {
-        await bindWalletToUser(authUid, accountId);
-      } catch (error) {
-        console.error('Failed to bind wallet:', error.message);
-        return sendWalletOwnershipUnavailable(res, error, 'WALLET_BINDING_FAILED');
-      }
-    }
-  }
-
-  // Check sponsor balance alarm
-  checkSponsorBalanceAlarm().catch(() => {});
-
-  const status = await getAccountStatus(accountId);
+    const status = await getAccountStatus(accountId);
 
   if (status.exists && status.hasTrustline) {
     return res.json({
@@ -697,6 +663,7 @@ module.exports = {
   startupPromise,
   ingestWorker,
   keyManager,
+  SupabaseRequestError,
   ...(process.env.NODE_ENV === 'test' ? {
     testHooks: Object.freeze({
       keyManager,
@@ -709,6 +676,8 @@ module.exports = {
       reserveAddMoneyClaim,
       settleAddMoneyClaim,
       supabaseRestRequest,
+      SupabaseRequestError,
+      isPostgresUniqueViolation,
       checkPaymentLimits,
       getPaymentLimitsStatus,
       recordPaymentRecord,
@@ -719,6 +688,7 @@ module.exports = {
       prunePreparedAccountTransactions,
       activeAddMoneyUserLocks,
       pruneActiveAddMoneyUserLocks,
+      requireAccountPreparationOwnership,
     }),
   } : {}),
 };
@@ -1112,6 +1082,70 @@ function requirePathWalletOwnership() {
         code: 'WALLET_OWNERSHIP_DENIED',
       });
     }
+    return next();
+  };
+}
+
+/**
+ * Middleware for /accounts/prepare.
+ * Enforces wallet ownership, uniqueness (cannot prepare wallet bound to another user),
+ * per-user sponsorship limits, and durable blocking binding.
+ */
+function requireAccountPreparationOwnership(walletField = 'accountId') {
+  return async function (req, res, next) {
+    let accountId;
+    try {
+      accountId = assertAccountId(req.body && req.body[walletField], walletField);
+    } catch (error) {
+      return res.status(400).json({ error: error.message });
+    }
+
+    if (!config.authRequired) {
+      return next();
+    }
+
+    const authUid = req.auth && req.auth.sub;
+    if (!authUid) {
+      return res.status(401).json({
+        error: 'Authentication required',
+        code: 'AUTH_REQUIRED',
+      });
+    }
+
+    const ownerResult = await resolveWalletOwner(accountId);
+    if (!ownerResult.configured || !ownerResult.ok) {
+      return sendWalletOwnershipUnavailable(res, ownerResult.error);
+    }
+
+    if (ownerResult.owner && ownerResult.owner !== authUid) {
+      return res.status(403).json({
+        error: 'You are not authorized to prepare this wallet (already bound to another user)',
+        code: 'WALLET_OWNERSHIP_DENIED',
+      });
+    }
+
+    if (!ownerResult.owner) {
+      const walletsResult = await resolveUserWallets(authUid);
+      if (!walletsResult.configured || !walletsResult.ok) {
+        return sendWalletOwnershipUnavailable(res, walletsResult.error);
+      }
+
+      if (walletsResult.wallets.length >= config.maxSponsoredAccountsPerUser) {
+        return res.status(403).json({
+          error: `Maximum sponsored accounts limit (${config.maxSponsoredAccountsPerUser}) reached for this user`,
+          code: 'SPONSORSHIP_LIMIT_EXCEEDED',
+          maxAccounts: config.maxSponsoredAccountsPerUser,
+        });
+      }
+
+      try {
+        await bindWalletToUser(authUid, accountId);
+      } catch (error) {
+        console.error('Failed to bind wallet:', error.message);
+        return sendWalletOwnershipUnavailable(res, error, 'WALLET_BINDING_FAILED');
+      }
+    }
+
     return next();
   };
 }
@@ -1613,10 +1647,6 @@ function createAddMoneyPersistenceError(cause, operation) {
   return error;
 }
 
-function isPostgresUniqueViolation(error) {
-  return error?.code === '23505' || error?.body?.code === '23505';
-}
-
 function isSupabasePersistenceEnabled() {
   return Boolean(config.supabaseUrl && config.supabaseServiceRoleKey);
 }
@@ -1863,46 +1893,13 @@ async function assertWalletBindingsReachable() {
 }
 
 async function supabaseRestRequest(path, options = {}) {
-  if (typeof fetch !== 'function') {
-    throw new Error('global fetch is unavailable in this Node runtime');
-  }
-
-  const baseUrl = config.supabaseUrl.replace(/\/$/, '');
-  const response = await fetch(`${baseUrl}/rest/v1/${path}`, {
-    ...options,
-    headers: {
-      apikey: config.supabaseServiceRoleKey,
-      Authorization: `Bearer ${config.supabaseServiceRoleKey}`,
-      'Content-Type': 'application/json',
-      ...(options.headers || {}),
-    },
+  return executeSupabaseRequest({
+    baseUrl: config.supabaseUrl,
+    serviceRoleKey: config.supabaseServiceRoleKey,
+    path,
+    options,
+    fetchFn: typeof fetch === 'function' ? fetch : undefined,
   });
-  const text = await response.text();
-  let body = null;
-  if (text) {
-    try {
-      body = JSON.parse(text);
-    } catch {
-      body = null;
-    }
-  }
-
-  if (!response.ok) {
-    const error = new Error(body?.message || text || `Supabase request failed with status ${response.status}`);
-    error.status = response.status;
-    error.body = body;
-    error.code = body?.code;
-    error.response = { status: response.status, data: body };
-    throw error;
-  }
-
-  if (!text) {
-    return null;
-  }
-  if (body === null) {
-    throw new Error('Supabase returned a non-JSON response');
-  }
-  return body;
 }
 
 function getStellarErrorMessage(resultCodes) {

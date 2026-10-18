@@ -1,6 +1,6 @@
 BEGIN;
 
-SELECT plan(13);
+SELECT plan(18);
 
 SELECT has_table(
   'public',
@@ -111,6 +111,63 @@ SELECT ok(
 SELECT ok(
   NOT has_table_privilege('authenticated', 'public.transactions', 'INSERT'),
   'an authenticated anon-key client cannot INSERT transactions'
+);
+
+-- Participant isolation & client lockdown tests (#1, #123)
+INSERT INTO auth.users (id, email)
+VALUES
+  ('11111111-1111-1111-1111-111111111111', 'user1@test.com'),
+  ('22222222-2222-2222-2222-222222222222', 'user2@test.com'),
+  ('33333333-3333-3333-3333-333333333333', 'user3@test.com');
+
+INSERT INTO public.users (auth_user_id, wallet_address, email)
+VALUES
+  ('11111111-1111-1111-1111-111111111111', 'GA_USER_1_WALLET_ADDR', 'user1@test.com'),
+  ('22222222-2222-2222-2222-222222222222', 'GB_USER_2_WALLET_ADDR', 'user2@test.com'),
+  ('33333333-3333-3333-3333-333333333333', 'GC_USER_3_WALLET_ADDR', 'user3@test.com');
+
+INSERT INTO public.transactions (tx_hash, from_address, to_address, amount, status)
+VALUES
+  ('tx_user1_to_user2', 'GA_USER_1_WALLET_ADDR', 'GB_USER_2_WALLET_ADDR', 10.0, 'success'),
+  ('tx_user2_to_user3', 'GB_USER_2_WALLET_ADDR', 'GC_USER_3_WALLET_ADDR', 25.0, 'success');
+
+-- 1. As authenticated user1:
+SET LOCAL ROLE authenticated;
+SET LOCAL "request.jwt.claim.sub" = '11111111-1111-1111-1111-111111111111';
+
+SELECT results_eq(
+  'SELECT tx_hash FROM transactions ORDER BY tx_hash',
+  ARRAY['tx_user1_to_user2'],
+  'a user can only SELECT transactions where they are participant'
+);
+
+SELECT is_empty(
+  'SELECT tx_hash FROM transactions WHERE tx_hash = ''tx_user2_to_user3''',
+  'a user cannot SELECT another user''s transaction rows'
+);
+
+SELECT throws_ok(
+  'INSERT INTO transactions (tx_hash, from_address, to_address, amount, status) VALUES (''rogue_tx'', ''GA_USER_1_WALLET_ADDR'', ''GB_USER_2_WALLET_ADDR'', 50.0, ''success'')',
+  '42501',
+  NULL,
+  'authenticated user cannot INSERT into transactions'
+);
+
+-- 2. As anon role:
+SET LOCAL ROLE anon;
+
+SELECT throws_ok(
+  'SELECT * FROM transactions',
+  '42501',
+  NULL,
+  'anon role cannot SELECT from transactions'
+);
+
+SELECT throws_ok(
+  'INSERT INTO transactions (tx_hash, from_address, to_address, amount, status) VALUES (''anon_tx'', ''GA_USER_1_WALLET_ADDR'', ''GB_USER_2_WALLET_ADDR'', 50.0, ''success'')',
+  '42501',
+  NULL,
+  'anon role cannot INSERT into transactions'
 );
 
 SELECT * FROM finish();
