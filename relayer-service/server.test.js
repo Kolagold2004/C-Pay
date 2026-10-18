@@ -496,6 +496,37 @@ describe('/accounts/prepare ownership', () => {
       retryable: true,
     }));
   });
+
+  it('blocks preparing a new account when the user has reached the sponsorship limit', async () => {
+    expressApp = await loadServer({
+      MAX_SPONSORED_ACCOUNTS_PER_USER: '1',
+      __fetchMock: buildFetchMock({
+        userWallets: { [USER_A]: [WALLET_A] },
+      }),
+    });
+
+    const newWallet = StellarSdk.Keypair.random().publicKey();
+    const { status, body } = await postJson(
+      expressApp,
+      '/accounts/prepare',
+      { accountId: newWallet },
+      { Authorization: makeBearerToken(USER_A) }
+    );
+
+    expect(status).toBe(403);
+    expect(body.code).toBe('SPONSORSHIP_LIMIT_EXCEEDED');
+  });
+
+  it('rejects invalid accountId in requireAccountPreparationOwnership with 400', async () => {
+    const { status } = await postJson(
+      expressApp,
+      '/accounts/prepare',
+      { accountId: 'not-a-valid-account-id' },
+      { Authorization: makeBearerToken(USER_A) }
+    );
+
+    expect(status).toBe(400);
+  });
 });
 
 // ── /add-money ───────────────────────────────────────────────────────────────
@@ -847,6 +878,22 @@ describe('ownership infrastructure failures', () => {
     const { status, body } = await postJson(
       expressApp,
       '/add-money',
+      { accountId: WALLET_A },
+      { Authorization: makeBearerToken(USER_A) }
+    );
+
+    expect(status).toBe(503);
+    expect(body.code).toBe('WALLET_OWNERSHIP_UNAVAILABLE');
+  });
+
+  it('rejects /accounts/prepare when the wallet binding lookup fails', async () => {
+    const expressApp = await loadServer({
+      __fetchMock: buildFetchMock({ failOwnershipLookup: true }),
+    });
+
+    const { status, body } = await postJson(
+      expressApp,
+      '/accounts/prepare',
       { accountId: WALLET_A },
       { Authorization: makeBearerToken(USER_A) }
     );
