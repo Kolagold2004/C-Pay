@@ -50,7 +50,6 @@ export const ChangePINScreen: React.FC<ChangePINScreenProps> = ({ navigation }) 
         setTimeout(() => setCurrentPin(''), 300);
       }
     } catch (err) {
-// [SECURITY] Removed sensitive log: console.error('PIN verification error:', err);
       setError('Error verifying PIN');
       setTimeout(() => setCurrentPin(''), 300);
     }
@@ -103,7 +102,6 @@ export const ChangePINScreen: React.FC<ChangePINScreenProps> = ({ navigation }) 
         ]
       );
     } catch (err: any) {
-// [SECURITY] Removed sensitive log: console.error('Failed to change PIN:', err);
       setError(err.message || 'Failed to update PIN');
       setLoading(false);
       

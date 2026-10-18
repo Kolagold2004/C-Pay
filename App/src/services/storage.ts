@@ -84,13 +84,9 @@ export async function saveTransaction(tx: Transaction): Promise<void> {
 
     await AsyncStorage.setItem('transactions', JSON.stringify(nextTxs));
 
-// [SECURITY] Removed sensitive log: console.log('✅ Transaction saved locally:', txWithTime.tx_hash);
-
     // Emit event for real-time UI updates
     storageEvents.emit('transactionSaved', txWithTime);
-// [SECURITY] Removed sensitive log: console.log('📡 Emitted transactionSaved event');
   } catch (error) {
-// [SECURITY] Removed sensitive log: console.error('Error saving transaction:', error);
     throw error;
   }
 }
@@ -101,8 +97,6 @@ export async function getTransactions(): Promise<Transaction[]> {
     const local = await AsyncStorage.getItem('transactions');
     const rawLocalTxs = local ? JSON.parse(local) : [];
     const localTxs = rawLocalTxs.filter((tx: Transaction) => isValidTransactionHash(tx.tx_hash));
-    
-// [SECURITY] Removed sensitive log: console.log(`📦 Loaded ${localTxs.length} transactions from local storage`);
 
     // Sync with Supabase in background (read-only trusted receipts)
     try {
@@ -120,7 +114,6 @@ export async function getTransactions(): Promise<Transaction[]> {
       // isValidAccountId uses the Stellar SDK's Ed25519 public-key checker,
       // which rejects anything that isn't a well-formed G-account address.
       if (!isValidAccountId(walletAddress)) {
-// [SECURITY] Removed sensitive log: console.warn('Skipping Supabase fetch: wallet address failed validation', walletAddress);
         return localTxs;
       }
 
@@ -136,7 +129,6 @@ export async function getTransactions(): Promise<Transaction[]> {
 
       if (data && !error && data.length > 0) {
         const chainTxs = data.filter((tx: Transaction) => isValidTransactionHash(tx.tx_hash));
-// [SECURITY] Removed sensitive log: console.log(`☁️ Loaded ${chainTxs.length} transactions from Supabase`);
 
         // Merge local and cloud data (remove duplicates by tx_hash)
         const mergedTxs = [...chainTxs];
@@ -156,13 +148,12 @@ export async function getTransactions(): Promise<Transaction[]> {
         return mergedTxs;
       }
     } catch (supabaseError) {
-      Logger.info('Supabase fetch skipped (using local data):', supabaseError);
+      Logger.info('Supabase fetch skipped (using local data):', (supabaseError as any)?.code || (supabaseError as any)?.name || 'Error');
     }
 
     // Return local data
     return localTxs;
   } catch (error) {
-// [SECURITY] Removed sensitive log: console.error('Error getting transactions:', error);
     return [];
   }
 }
@@ -198,6 +189,5 @@ export async function updateTransactionStatus(
       await AsyncStorage.setItem('transactions', JSON.stringify(updated));
     }
   } catch (error) {
-// [SECURITY] Removed sensitive log: console.error('Error updating transaction status:', error);
   }
 }

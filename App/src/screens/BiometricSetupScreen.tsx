@@ -128,7 +128,6 @@ export const BiometricSetupScreen: React.FC<BiometricSetupScreenProps> = ({
         setLoading(false);
       }
     } catch (error) {
-// [SECURITY] Removed sensitive log: console.error('Biometric authentication error:', error);
       setLoading(false);
     }
   };

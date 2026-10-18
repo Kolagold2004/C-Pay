@@ -28,7 +28,6 @@ export function setPINDialogHandler(
 export async function authenticateWithPIN(): Promise<boolean> {
   try {
     if (!showPINDialog) {
-// [SECURITY] Removed sensitive log: console.error('PIN dialog handler not set');
       return false;
     }
 
@@ -48,7 +47,6 @@ export async function authenticateWithPIN(): Promise<boolean> {
 
     return result.success;
   } catch (error) {
-// [SECURITY] Removed sensitive log: console.error('PIN authentication error:', error);
     return false;
   }
 }
@@ -80,11 +78,9 @@ export async function getAuthenticatedWallet(
       }
     }
   } catch (error) {
-// [SECURITY] Removed sensitive log: console.log('Biometric wallet unlock unavailable, falling back to PIN:', error);
   }
 
   if (!showPINDialog) {
-// [SECURITY] Removed sensitive log: console.error('PIN dialog handler not set');
     return null;
   }
 
@@ -173,7 +169,6 @@ export async function authenticateWithBiometric(): Promise<boolean> {
     
     // If no biometric available, return false (caller should use PIN)
     if (!hasHardware || !isEnrolled) {
-// [SECURITY] Removed sensitive log: console.log('Biometric not available, PIN required');
       return false;
     }
 
@@ -186,7 +181,6 @@ export async function authenticateWithBiometric(): Promise<boolean> {
 
     return result.success;
   } catch (error) {
-// [SECURITY] Removed sensitive log: console.error('Biometric authentication error:', error);
     return false;
   }
 }

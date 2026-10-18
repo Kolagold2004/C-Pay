@@ -149,7 +149,6 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({ navigation }) => {
         AlertManager.alert('Authentication Failed', 'Please use your PIN to unlock this wallet.');
       }
     } catch (err) {
-// [SECURITY] Removed sensitive log: console.error('Biometric auth error:', err);
       AlertManager.alert('Authentication Failed', 'Please use your PIN to unlock this wallet.');
     }
   };
