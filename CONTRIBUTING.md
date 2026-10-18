@@ -116,7 +116,6 @@ npx expo install --check
 ```bash
 cd relayer-service
 node --check server.js
-node --check test-relayer.js
 npm test -- --passWithNoTests --runInBand
 ```
 
