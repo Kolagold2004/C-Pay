@@ -1,3 +1,4 @@
+import { Logger } from './logger';
 import * as LocalAuthentication from 'expo-local-authentication';
 import { Platform } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
@@ -27,7 +28,6 @@ export function setPINDialogHandler(
 export async function authenticateWithPIN(): Promise<boolean> {
   try {
     if (!showPINDialog) {
-      console.error('PIN dialog handler not set');
       return false;
     }
 
@@ -47,7 +47,6 @@ export async function authenticateWithPIN(): Promise<boolean> {
 
     return result.success;
   } catch (error) {
-    console.error('PIN authentication error:', error);
     return false;
   }
 }
@@ -79,11 +78,9 @@ export async function getAuthenticatedWallet(
       }
     }
   } catch (error) {
-    console.log('Biometric wallet unlock unavailable, falling back to PIN:', error);
   }
 
   if (!showPINDialog) {
-    console.error('PIN dialog handler not set');
     return null;
   }
 
@@ -156,7 +153,7 @@ export async function getBiometricType(): Promise<string> {
     
     return 'Biometric';
   } catch (error) {
-    console.error('Error getting biometric type:', error);
+    Logger.error('Error getting biometric type:', error);
     return 'Biometric';
   }
 }
@@ -172,7 +169,6 @@ export async function authenticateWithBiometric(): Promise<boolean> {
     
     // If no biometric available, return false (caller should use PIN)
     if (!hasHardware || !isEnrolled) {
-      console.log('Biometric not available, PIN required');
       return false;
     }
 
@@ -185,7 +181,6 @@ export async function authenticateWithBiometric(): Promise<boolean> {
 
     return result.success;
   } catch (error) {
-    console.error('Biometric authentication error:', error);
     return false;
   }
 }
@@ -241,7 +236,7 @@ export async function enableBiometric(options: { skipAvailabilityCheck?: boolean
 
     return enableWalletBiometricBackup('Secure biometric wallet access', wallet.secret);
   } catch (error) {
-    console.error('Biometric enable error:', error);
+    Logger.error('Biometric enable error:', error);
     return false;
   }
 }

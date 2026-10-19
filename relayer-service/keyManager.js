@@ -1,9 +1,10 @@
 /**
- * Key Manager & Signer Provider (Issue #58)
+ * Key Manager & Signer Provider (Issue #22, #117)
  *
- * Provides a secure custody abstraction for Stellar signing keys:
- * - Decouples business logic from raw secret keys in env files
- * - Supports KMS / HSM / Cloud Vault signers alongside local keypairs
+ * Provides a unified custody abstraction for Stellar signing keys:
+ * - Decouples route handlers and transaction builders from raw secret keys
+ * - Routes all relayer signing through KeyManager (local-keypair driver on testnet)
+ * - Eliminates deceptive KMS stubs; tracks KMS driver as an explicit mainnet launch gate
  * - Enables runtime zero-downtime key rotation
  * - Audits signing activity and alerts on velocity anomalies
  */
@@ -40,7 +41,7 @@ class KeyManager {
       return this.createKmsSigner(role, secretOrKmsId);
     }
 
-    // Default: Stellar Keypair from secret
+    // Default: Stellar Keypair from secret (testnet pilot posture)
     const keypair = StellarSdk.Keypair.fromSecret(secretOrKmsId);
     return {
       role,
@@ -61,32 +62,19 @@ class KeyManager {
   }
 
   createKmsSigner(role, kmsUri) {
-    // In production, connects to AWS KMS / GCP Cloud KMS / HashiCorp Vault.
-    // For local/test environments, uses an envelope or KMS driver.
-    let currentPublicKey = process.env[`${role.toUpperCase()}_PUBLIC_KEY`] || 'G_KMS_PLACEHOLDER';
+    throw new Error(
+      `KMS/Vault signer driver for role '${role}' (${kmsUri}) is not yet implemented. ` +
+      `Current testnet pilot posture uses the local-keypair driver ('env'). ` +
+      `Production KMS driver is tracked as a mainnet launch gate in docs/custody.md.`
+    );
+  }
 
-    return {
-      role,
-      type: 'kms',
-      kmsUri,
-      publicKey: () => currentPublicKey,
-      sign: async (tx) => {
-        this.recordActivity(role, 'kms_sign_transaction');
-        // KMS signs transaction hash with asymmetric Ed25519 key
-        // In real KMS integration:
-        // const sig = await kmsClient.sign({ KeyId: kmsUri, Message: tx.hash() });
-        // tx.addSignature(currentPublicKey, sig);
-        return tx;
-      },
-      signHash: async (hash) => {
-        this.recordActivity(role, 'kms_sign_hash');
-        return Buffer.alloc(64);
-      },
-      setPublicKey: (pk) => {
-        currentPublicKey = pk;
-      },
-      rotatedAt: new Date().toISOString(),
-    };
+  sign(role, tx) {
+    return this.getSigner(role).sign(tx);
+  }
+
+  getPublicKey(role) {
+    return this.getSigner(role).publicKey();
   }
 
   registerSigner(role, signer) {
@@ -117,7 +105,7 @@ class KeyManager {
       timestamp: new Date().toISOString(),
     };
     this.activityLog.push(logEntry);
-    console.log(`[KEY_CUSTODY] Key rotated successfully for role: ${role}`, logEntry);
+    console.log(`[KEY_CUSTODY] Key rotated successfully for role: ${role}`);
 
     this.sendAlert({
       event: 'KEY_ROTATED',

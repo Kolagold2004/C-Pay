@@ -1,3 +1,4 @@
+import { Logger } from '../utils/logger';
 /**
  * @file wallet.ts
  * @description Local Stellar wallet: key generation, PIN-based encryption,
@@ -88,17 +89,28 @@ import { pbkdf2Async } from '@noble/hashes/pbkdf2';
 import { sha256 } from '@noble/hashes/sha256';
 
 // ─── SecureStore keys ─────────────────────────────────────────────────────────
-const WALLET_KEY = 'cpay_stellar_wallet';
-const PIN_KEY = 'cpay_pin_hash';
-const SALT_KEY = 'cpay_pin_salt';
-const BIOMETRIC_BACKUP_KEY = 'cpay_stellar_biometric_backup';
-const BIOMETRIC_BACKUP_AVAILABLE_KEY = 'cpay_stellar_biometric_backup_available';
+export const WALLET_KEY = 'cpay_stellar_wallet';
+export const PIN_KEY = 'cpay_pin_hash';
+export const SALT_KEY = 'cpay_pin_salt';
+export const BIOMETRIC_BACKUP_KEY = 'cpay_stellar_biometric_backup';
+export const BIOMETRIC_BACKUP_AVAILABLE_KEY = 'cpay_stellar_biometric_backup_available';
 /** Persisted PIN attempt state: { attempts, lockedUntil } */
-const PIN_ATTEMPTS_KEY = 'cpay_pin_attempts';
+export const PIN_ATTEMPTS_KEY = 'cpay_pin_attempts';
+
+/**
+ * Active slot pointer & slot keys (issue #119 atomic PIN change)
+ * The slot pointer stores '0' or '1'. One single write to ACTIVE_SLOT_KEY flips
+ * the active wallet, salt, and verifier simultaneously.
+ */
+export const ACTIVE_SLOT_KEY = 'cpay_wallet_active_slot';
+export const SLOT_0_KEY = 'cpay_wallet_slot_0';
+export const SLOT_1_KEY = 'cpay_wallet_slot_1';
+export const PENDING_SLOT_KEY = 'cpay_wallet_slot_pending';
+
 /** Pending values make PIN changes recoverable if the app is killed mid-write. */
-const PENDING_WALLET_KEY = `${WALLET_KEY}_pending`;
-const PENDING_PIN_KEY = `${PIN_KEY}_pending`;
-const PENDING_SALT_KEY = `${SALT_KEY}_pending`;
+export const PENDING_WALLET_KEY = `${WALLET_KEY}_pending`;
+export const PENDING_PIN_KEY = `${PIN_KEY}_pending`;
+export const PENDING_SALT_KEY = `${SALT_KEY}_pending`;
 
 // ─── Versioning & KDF constants ───────────────────────────────────────────────
 const WALLET_STORAGE_VERSION = 4;
@@ -134,6 +146,8 @@ export const MAX_PIN_ATTEMPTS = 5;
 export const LOCKOUT_BASE_MS = 30_000; // 30 seconds
 /** Hard ceiling for any single lockout period. */
 export const MAX_LOCKOUT_MS = 60 * 60 * 1000; // 1 hour
+/** Fixed lockout duration used when SecureStore cannot be trusted. */
+const STORAGE_FAILURE_LOCKOUT_MS = MAX_LOCKOUT_MS;
 
 // ─── Local wipe policy ────────────────────────────────────────────────────────
 /**
@@ -181,6 +195,19 @@ type StoredPinVerifierPayload = {
   updatedAt: string;
 };
 
+/**
+ * Atomic bundle stored in a slot (issue #119).
+ * Contains the encrypted wallet blob, salt, and verifier payload together
+ * so they can never disagree if a process is killed mid-operation.
+ */
+export type StoredWalletBundle = {
+  version: 1;
+  wallet: string; // JSON of StoredWalletPayload
+  salt: string;   // hex string
+  verifier: string; // JSON of StoredPinVerifierPayload or legacy hex
+  updatedAt: string;
+};
+
 type CachedPin = {
   pin: string;
   expiresAt: number;
@@ -222,6 +249,10 @@ export type GetWalletResult =
   | { success: true; wallet: StellarWallet }
   | { success: false; wallet: null; error: WalletOperationError; rawError?: unknown };
 
+export type PinAttemptStateResult =
+  | { status: 'available'; state: PinAttemptState }
+  | { status: 'unknown' };
+
 // ─── In-memory session state ──────────────────────────────────────────────────
 
 let cachedPinHash: string | null = null;
@@ -252,19 +283,19 @@ function getCachedPin(): string | null {
 
 /**
  * Read the current PIN attempt state from SecureStore.
- * Returns a zeroed state if nothing is stored yet.
+ * Returns an available zeroed state if nothing is stored yet.
  */
-export async function getPinAttemptState(): Promise<PinAttemptState> {
+export async function getPinAttemptState(): Promise<PinAttemptStateResult> {
   try {
     const raw = await SecureStore.getItemAsync(PIN_ATTEMPTS_KEY);
-    if (!raw) return { attempts: 0, lockedUntil: 0 };
+    if (!raw) return { status: 'available', state: { attempts: 0, lockedUntil: 0 } };
     const parsed = JSON.parse(raw) as Partial<PinAttemptState>;
-    return {
-      attempts: typeof parsed.attempts === 'number' ? parsed.attempts : 0,
-      lockedUntil: typeof parsed.lockedUntil === 'number' ? parsed.lockedUntil : 0,
-    };
+    if (typeof parsed.attempts !== 'number' || typeof parsed.lockedUntil !== 'number') {
+      return { status: 'unknown' };
+    }
+    return { status: 'available', state: { attempts: parsed.attempts, lockedUntil: parsed.lockedUntil } };
   } catch {
-    return { attempts: 0, lockedUntil: 0 };
+    return { status: 'unknown' };
   }
 }
 
@@ -274,10 +305,10 @@ export async function getPinAttemptState(): Promise<PinAttemptState> {
  */
 export async function recordFailedPinAttempt(): Promise<PinAttemptState> {
   const current = await getPinAttemptState();
-  const attempts = current.attempts + 1;
+  const attempts = current.status === 'available' ? current.state.attempts + 1 : 0;
 
-  let lockedUntil = 0;
-  if (attempts >= MAX_PIN_ATTEMPTS) {
+  let lockedUntil = current.status === 'unknown' ? Date.now() + STORAGE_FAILURE_LOCKOUT_MS : 0;
+  if (current.status === 'available' && attempts >= MAX_PIN_ATTEMPTS) {
     // Extra attempts beyond the threshold double the delay each time.
     const extraAttempts = attempts - MAX_PIN_ATTEMPTS;
     const delay = Math.min(LOCKOUT_BASE_MS * Math.pow(2, extraAttempts), MAX_LOCKOUT_MS);
@@ -285,7 +316,11 @@ export async function recordFailedPinAttempt(): Promise<PinAttemptState> {
   }
 
   const next: PinAttemptState = { attempts, lockedUntil };
-  await SecureStore.setItemAsync(PIN_ATTEMPTS_KEY, JSON.stringify(next));
+  try {
+    await SecureStore.setItemAsync(PIN_ATTEMPTS_KEY, JSON.stringify(next));
+  } catch {
+    return { attempts, lockedUntil: Date.now() + STORAGE_FAILURE_LOCKOUT_MS };
+  }
   return next;
 }
 
@@ -347,6 +382,106 @@ export async function wipeWalletAfterFailedAttempts(): Promise<void> {
   await clearWallet();
 }
 
+/**
+ * Detect and resolve a half-finished PIN change (issue #119).
+ *
+ * Runs automatically on startup (in SplashScreen via hasWallet) and before any
+ * PIN verification, wallet read, PIN change, or wallet wipe.
+ *
+ * If the atomic pointer write (ACTIVE_SLOT_KEY) completed before an interruption:
+ *   - The change succeeded. Finalize by syncing legacy keys and deleting old slot.
+ * If the process was interrupted before the atomic pointer write:
+ *   - The change did not happen. Roll back by deleting the staged slot.
+ * If an interrupted legacy 3-write commit is detected (WALLET_KEY === PENDING_WALLET_KEY):
+ *   - Roll forward salt and pin verifier so verifier and blob agree.
+ */
+export async function recoverPendingPinChange(): Promise<void> {
+  try {
+    const pendingSlot = await SecureStore.getItemAsync(PENDING_SLOT_KEY);
+    const activeSlot = await SecureStore.getItemAsync(ACTIVE_SLOT_KEY);
+
+    if (pendingSlot === '0' || pendingSlot === '1') {
+      const pendingSlotKey = pendingSlot === '0' ? SLOT_0_KEY : SLOT_1_KEY;
+      const otherSlotKey = pendingSlot === '0' ? SLOT_1_KEY : SLOT_0_KEY;
+
+      if (activeSlot === pendingSlot) {
+        // Atomic commit write succeeded before the interruption!
+        // Finalize: mirror active bundle to legacy keys and delete old slot.
+        const raw = await SecureStore.getItemAsync(pendingSlotKey);
+        if (raw) {
+          try {
+            const bundle = JSON.parse(raw) as StoredWalletBundle;
+            if (bundle.wallet && bundle.salt && bundle.verifier) {
+              await SecureStore.setItemAsync(WALLET_KEY, bundle.wallet);
+              await SecureStore.setItemAsync(SALT_KEY, bundle.salt);
+              await SecureStore.setItemAsync(PIN_KEY, bundle.verifier);
+            }
+          } catch {}
+        }
+        await SecureStore.deleteItemAsync(otherSlotKey);
+        await SecureStore.deleteItemAsync(PENDING_SLOT_KEY);
+        await SecureStore.deleteItemAsync(PENDING_WALLET_KEY);
+        await SecureStore.deleteItemAsync(PENDING_SALT_KEY);
+        await SecureStore.deleteItemAsync(PENDING_PIN_KEY);
+      } else {
+        // Interrupted before atomic pointer write.
+        // Roll back: delete pending slot and pending markers.
+        await SecureStore.deleteItemAsync(pendingSlotKey);
+        await SecureStore.deleteItemAsync(PENDING_SLOT_KEY);
+        await SecureStore.deleteItemAsync(PENDING_WALLET_KEY);
+        await SecureStore.deleteItemAsync(PENDING_SALT_KEY);
+        await SecureStore.deleteItemAsync(PENDING_PIN_KEY);
+      }
+      return;
+    }
+
+    // Legacy recovery path (from earlier code before slot pointers existed):
+    const pendingWallet = await SecureStore.getItemAsync(PENDING_WALLET_KEY);
+    if (pendingWallet) {
+      const currentWallet = await SecureStore.getItemAsync(WALLET_KEY);
+      const pendingSalt = await SecureStore.getItemAsync(PENDING_SALT_KEY);
+      const pendingPin = await SecureStore.getItemAsync(PENDING_PIN_KEY);
+
+      if (currentWallet === pendingWallet && pendingSalt && pendingPin) {
+        // Legacy Write 1 (WALLET_KEY) succeeded before crash.
+        // Roll forward to pending credentials so verifier matches the blob.
+        await SecureStore.setItemAsync(SALT_KEY, pendingSalt);
+        await SecureStore.setItemAsync(PIN_KEY, pendingPin);
+        const bundle: StoredWalletBundle = {
+          version: 1,
+          wallet: currentWallet,
+          salt: pendingSalt,
+          verifier: pendingPin,
+          updatedAt: new Date().toISOString(),
+        };
+        await SecureStore.setItemAsync(SLOT_0_KEY, JSON.stringify(bundle));
+        await SecureStore.setItemAsync(ACTIVE_SLOT_KEY, '0');
+      } else {
+        // Crash before legacy Write 1: roll back pending keys.
+        const currentSalt = await SecureStore.getItemAsync(SALT_KEY);
+        const currentPin = await SecureStore.getItemAsync(PIN_KEY);
+        if (currentWallet && currentSalt && currentPin) {
+          const bundle: StoredWalletBundle = {
+            version: 1,
+            wallet: currentWallet,
+            salt: currentSalt,
+            verifier: currentPin,
+            updatedAt: new Date().toISOString(),
+          };
+          await SecureStore.setItemAsync(SLOT_0_KEY, JSON.stringify(bundle));
+          await SecureStore.setItemAsync(ACTIVE_SLOT_KEY, '0');
+        }
+      }
+
+      await SecureStore.deleteItemAsync(PENDING_WALLET_KEY);
+      await SecureStore.deleteItemAsync(PENDING_SALT_KEY);
+      await SecureStore.deleteItemAsync(PENDING_PIN_KEY);
+    }
+  } catch (error) {
+    Logger.error('Error recovering pending PIN change:', error);
+  }
+}
+
 // ─── Core wallet API ──────────────────────────────────────────────────────────
 
 export async function getWalletFromSession(): Promise<StellarWallet | null> {
@@ -365,7 +500,7 @@ export async function createWallet(pin: string): Promise<string> {
   const publicKey = keypair.publicKey();
   const secret = keypair.secret();
 
-  await Promise.all([storeSecret(secret, pin), storePinVerifier(pin)]);
+  await persistWalletBundle(secret, pin);
   cachePinForSession(pin);
   cacheWalletForSession(secret);
 
@@ -388,7 +523,7 @@ export async function getWallet(pin: string): Promise<GetWalletResult> {
     const wallet = cacheWalletForSession(secret);
     return { success: true, wallet };
   } catch (error) {
-    console.error('Error getting wallet:', error);
+    Logger.error('Error getting wallet:', error);
     return { success: false, wallet: null, error: 'STORAGE_ERROR', rawError: error };
   }
 }
@@ -403,11 +538,23 @@ export async function getWalletFromBiometricBackup(
 
 export async function hasWallet(): Promise<boolean> {
   try {
+    await recoverPendingPinChange();
+    const activeSlot = await SecureStore.getItemAsync(ACTIVE_SLOT_KEY);
+    if (activeSlot === '0' || activeSlot === '1') {
+      const slotKey = activeSlot === '0' ? SLOT_0_KEY : SLOT_1_KEY;
+      const raw = await SecureStore.getItemAsync(slotKey);
+      if (raw) {
+        try {
+          const parsed = JSON.parse(raw) as Partial<StoredWalletBundle>;
+          if (parsed.wallet && parsed.verifier) return true;
+        } catch {}
+      }
+    }
     const wallet = await SecureStore.getItemAsync(WALLET_KEY);
     const pin = await SecureStore.getItemAsync(PIN_KEY);
     return !!wallet && !!pin;
   } catch (error) {
-    console.error('Error checking wallet:', error);
+    Logger.error('Error checking wallet:', error);
     return false;
   }
 }
@@ -415,39 +562,55 @@ export async function hasWallet(): Promise<boolean> {
 export async function verifyPin(pin: string, options: VerifyPinOptions = {}): Promise<VerifyPinResult> {
   try {
     const { migrate = true, blockMigration = true } = options;
-    const candidates = [
-      [PIN_KEY, SALT_KEY],
-      [PENDING_PIN_KEY, PENDING_SALT_KEY],
-    ] as const;
-    let pinHash: string | null = null;
-    let verifier: ReturnType<typeof parsePinVerifier> | null = null;
-    for (const [pinKey, saltKey] of candidates) {
-      const [storedPinVerifier, saltHex] = await Promise.all([
-        SecureStore.getItemAsync(pinKey), SecureStore.getItemAsync(saltKey),
-      ]);
-      if (!storedPinVerifier || !saltHex) continue;
-      const parsed = parsePinVerifier(storedPinVerifier);
-      const candidateHash = await hashPinWithSalt(pin, saltHex, parsed.kdfIterations);
-      if (parsed.hash === candidateHash) {
-        pinHash = candidateHash;
-        verifier = parsed;
-        break;
+    await recoverPendingPinChange();
+
+    let verifierRaw: string | null = null;
+    let saltHex: string | null = null;
+
+    // 1. Try reading verifier and salt from active slot
+    const activeSlot = await SecureStore.getItemAsync(ACTIVE_SLOT_KEY);
+    if (activeSlot === '0' || activeSlot === '1') {
+      const slotKey = activeSlot === '0' ? SLOT_0_KEY : SLOT_1_KEY;
+      const rawSlot = await SecureStore.getItemAsync(slotKey);
+      if (rawSlot) {
+        try {
+          const bundle = JSON.parse(rawSlot) as StoredWalletBundle;
+          if (bundle.verifier && bundle.salt) {
+            verifierRaw = bundle.verifier;
+            saltHex = bundle.salt;
+          }
+        } catch {}
       }
     }
 
-    const isValid = pinHash !== null;
+    // 2. Fall back to legacy keys if no active slot is set
+    if (!verifierRaw || !saltHex) {
+      const [legacyVerifier, legacySalt] = await Promise.all([
+        SecureStore.getItemAsync(PIN_KEY),
+        SecureStore.getItemAsync(SALT_KEY),
+      ]);
+      verifierRaw = legacyVerifier;
+      saltHex = legacySalt;
+    }
 
-    if (isValid) {
-      cachedPinHash = pinHash!;
+    if (!verifierRaw || !saltHex) {
+      return { success: false, error: 'INVALID_PIN' };
+    }
+
+    const parsed = parsePinVerifier(verifierRaw);
+    const candidateHash = await hashPinWithSalt(pin, saltHex, parsed.kdfIterations);
+
+    if (parsed.hash === candidateHash) {
+      cachedPinHash = candidateHash;
       cachePinForSession(pin);
 
-      if (verifier!.needsMigration && migrate) {
+      if (parsed.needsMigration && migrate) {
         const migration = storePinVerifier(pin);
         if (blockMigration) {
           await migration;
         } else {
-          void migration.catch((error) => {
-            console.warn('PIN verifier migration failed:', error);
+          void migration.catch((_error) => {
+            // Non-blocking migration error
           });
         }
       }
@@ -456,12 +619,14 @@ export async function verifyPin(pin: string, options: VerifyPinOptions = {}): Pr
 
     return { success: false, error: 'INVALID_PIN' };
   } catch (error) {
-    console.error('Error verifying PIN:', error);
     return { success: false, error: 'STORAGE_ERROR', rawError: error };
   }
 }
 
 export async function changeWalletPin(oldPin: string, newPin: string): Promise<void> {
+  // 1. First recover any half-committed change if a previous attempt was killed.
+  await recoverPendingPinChange();
+
   const pinResult = await verifyPin(oldPin, { migrate: false });
   if (!pinResult.success) {
     if (pinResult.error === 'STORAGE_ERROR') {
@@ -473,10 +638,16 @@ export async function changeWalletPin(oldPin: string, newPin: string): Promise<v
   const secret = await readSecret(oldPin);
   if (!secret) throw new Error('Wallet not found');
 
-  // Stage every new value first. The old wallet remains usable until the
-  // staged wallet and verifier have both been written and validated.
-  const pendingSalt = bytesToHex(await Crypto.getRandomBytesAsync(16));
-  const pendingHash = await hashPinWithSalt(newPin, pendingSalt, PIN_KDF_ITERATIONS);
+  // 2. Determine target inactive slot
+  const currentSlot = await SecureStore.getItemAsync(ACTIVE_SLOT_KEY);
+  const nextSlot: '0' | '1' = currentSlot === '0' ? '1' : '0';
+  const nextSlotKey = nextSlot === '0' ? SLOT_0_KEY : SLOT_1_KEY;
+  const currentSlotKey = currentSlot === '1' ? SLOT_1_KEY : SLOT_0_KEY;
+
+  // 3. Stage the entire new credential bundle (wallet blob, salt, verifier)
+  const pendingSaltBytes = await Crypto.getRandomBytesAsync(16);
+  const pendingSaltHex = bytesToHex(pendingSaltBytes);
+  const pendingHash = await hashPinWithSalt(newPin, pendingSaltHex, PIN_KDF_ITERATIONS);
   const pendingVerifier: StoredPinVerifierPayload = {
     version: PIN_VERIFIER_VERSION,
     kdf: 'pbkdf2-sha256',
@@ -484,23 +655,59 @@ export async function changeWalletPin(oldPin: string, newPin: string): Promise<v
     hash: pendingHash,
     updatedAt: new Date().toISOString(),
   };
-  await SecureStore.setItemAsync(PENDING_SALT_KEY, pendingSalt);
-  await SecureStore.setItemAsync(PENDING_PIN_KEY, JSON.stringify(pendingVerifier));
-  await storeSecretWithSalt(secret, newPin, hexToBytes(pendingSalt), PENDING_WALLET_KEY);
-  if (!(await readSecretAt(newPin, PENDING_WALLET_KEY))) {
+
+  const pendingWalletPayload = await buildWalletPayload(secret, newPin, pendingSaltBytes);
+  const pendingWalletJson = JSON.stringify(pendingWalletPayload);
+  const pendingVerifierJson = JSON.stringify(pendingVerifier);
+
+  const pendingBundle: StoredWalletBundle = {
+    version: 1,
+    wallet: pendingWalletJson,
+    salt: pendingSaltHex,
+    verifier: pendingVerifierJson,
+    updatedAt: new Date().toISOString(),
+  };
+
+  // Validate staged payload decryption in memory before making any disk write
+  const testKey = await deriveWalletKey(newPin, pendingSaltBytes, WALLET_KDF_ITERATIONS);
+  const testCipher = xchacha20poly1305(testKey, hexToBytes(pendingWalletPayload.nonce));
+  const testPlaintext = testCipher.decrypt(hexToBytes(pendingWalletPayload.ciphertext));
+  if (bytesToUtf8(testPlaintext) !== secret) {
     throw new Error('Unable to validate staged wallet during PIN change');
   }
 
-  // Copying can be interrupted safely: verifyPin/readSecret also inspect the
-  // complete pending set, so either old or new credentials remain usable.
-  await SecureStore.setItemAsync(WALLET_KEY, (await SecureStore.getItemAsync(PENDING_WALLET_KEY))!);
-  await SecureStore.setItemAsync(SALT_KEY, pendingSalt);
-  await SecureStore.setItemAsync(PIN_KEY, JSON.stringify(pendingVerifier));
+  // 4. Stage to next slot and mark pending
+  await SecureStore.setItemAsync(nextSlotKey, JSON.stringify(pendingBundle));
+  await SecureStore.setItemAsync(PENDING_SLOT_KEY, nextSlot);
+
+  // Maintain legacy pending keys for backwards compatibility with legacy recovery
+  await SecureStore.setItemAsync(PENDING_WALLET_KEY, pendingWalletJson);
+  await SecureStore.setItemAsync(PENDING_SALT_KEY, pendingSaltHex);
+  await SecureStore.setItemAsync(PENDING_PIN_KEY, pendingVerifierJson);
+
+  // ─── 5. ATOMIC COMMIT ───────────────────────────────────────────────────────
+  // One single key write flips old → new atomically.
+  // Before this line: ACTIVE_SLOT_KEY points to currentSlot (old PIN, salt, verifier).
+  // After this line: ACTIVE_SLOT_KEY points to nextSlot (new PIN, salt, verifier).
+  // A crash at ANY time leaves either the old or new slot fully consistent.
+  await SecureStore.setItemAsync(ACTIVE_SLOT_KEY, nextSlot);
+
+  // 6. Post-commit: mirror to legacy keys and clean up old slot and pending state
   await Promise.all([
+    SecureStore.setItemAsync(WALLET_KEY, pendingWalletJson),
+    SecureStore.setItemAsync(SALT_KEY, pendingSaltHex),
+    SecureStore.setItemAsync(PIN_KEY, pendingVerifierJson),
+  ]);
+
+  await Promise.all([
+    SecureStore.deleteItemAsync(PENDING_SLOT_KEY),
+    SecureStore.deleteItemAsync(currentSlotKey),
     SecureStore.deleteItemAsync(PENDING_WALLET_KEY),
     SecureStore.deleteItemAsync(PENDING_SALT_KEY),
     SecureStore.deleteItemAsync(PENDING_PIN_KEY),
   ]);
+
+  cachedPinHash = pendingHash;
   cachePinForSession(newPin);
   cacheWalletForSession(secret);
 }
@@ -516,12 +723,41 @@ async function storePinVerifier(pin: string): Promise<void> {
     hash: pinHash,
     updatedAt: new Date().toISOString(),
   };
-  await SecureStore.setItemAsync(PIN_KEY, JSON.stringify(payload));
+  const verifierJson = JSON.stringify(payload);
+  await SecureStore.setItemAsync(PIN_KEY, verifierJson);
   cachedPinHash = pinHash;
+
+  // Keep active slot bundle in sync if one exists
+  const activeSlot = await SecureStore.getItemAsync(ACTIVE_SLOT_KEY);
+  if (activeSlot === '0' || activeSlot === '1') {
+    const slotKey = activeSlot === '0' ? SLOT_0_KEY : SLOT_1_KEY;
+    const rawSlot = await SecureStore.getItemAsync(slotKey);
+    if (rawSlot) {
+      try {
+        const bundle = JSON.parse(rawSlot) as StoredWalletBundle;
+        bundle.verifier = verifierJson;
+        bundle.updatedAt = new Date().toISOString();
+        await SecureStore.setItemAsync(slotKey, JSON.stringify(bundle));
+      } catch {}
+    }
+  }
 }
 
 async function hashPin(pin: string): Promise<string> {
   let saltHex = await SecureStore.getItemAsync(SALT_KEY);
+  if (!saltHex) {
+    const activeSlot = await SecureStore.getItemAsync(ACTIVE_SLOT_KEY);
+    if (activeSlot === '0' || activeSlot === '1') {
+      const slotKey = activeSlot === '0' ? SLOT_0_KEY : SLOT_1_KEY;
+      const rawSlot = await SecureStore.getItemAsync(slotKey);
+      if (rawSlot) {
+        try {
+          const bundle = JSON.parse(rawSlot) as StoredWalletBundle;
+          if (bundle.salt) saltHex = bundle.salt;
+        } catch {}
+      }
+    }
+  }
   if (!saltHex) {
     saltHex = bytesToHex(await Crypto.getRandomBytesAsync(16));
     await SecureStore.setItemAsync(SALT_KEY, saltHex);
@@ -576,18 +812,18 @@ async function deriveWalletKey(pin: string, salt: Uint8Array, iterations: number
 
 // ─── Wallet encryption ────────────────────────────────────────────────────────
 
-async function storeSecret(secret: string, pin: string): Promise<void> {
-  await storeSecretWithSalt(secret, pin, await Crypto.getRandomBytesAsync(16), WALLET_KEY);
-}
-
-async function storeSecretWithSalt(secret: string, pin: string, salt: Uint8Array, keyName: string): Promise<void> {
+async function buildWalletPayload(
+  secret: string,
+  pin: string,
+  salt: Uint8Array,
+): Promise<StoredWalletPayload> {
   const wallet = createWalletObject(secret);
   const nonce = await Crypto.getRandomBytesAsync(24);
   const key = await deriveWalletKey(pin, salt, WALLET_KDF_ITERATIONS);
   const cipher = xchacha20poly1305(key, nonce);
   const ciphertext = cipher.encrypt(utf8ToBytes(secret));
 
-  const payload: StoredWalletPayload = {
+  return {
     version: WALLET_STORAGE_VERSION,
     publicKey: wallet.publicKey,
     cipher: 'xchacha20-poly1305',
@@ -599,7 +835,60 @@ async function storeSecretWithSalt(secret: string, pin: string, salt: Uint8Array
     ciphertext: bytesToHex(ciphertext),
     updatedAt: new Date().toISOString(),
   };
+}
 
+async function persistWalletBundle(secret: string, pin: string): Promise<void> {
+  const saltBytes = await Crypto.getRandomBytesAsync(16);
+  const saltHex = bytesToHex(saltBytes);
+  const pinHash = await hashPinWithSalt(pin, saltHex, PIN_KDF_ITERATIONS);
+
+  const verifierPayload: StoredPinVerifierPayload = {
+    version: PIN_VERIFIER_VERSION,
+    kdf: 'pbkdf2-sha256',
+    kdfIterations: PIN_KDF_ITERATIONS,
+    hash: pinHash,
+    updatedAt: new Date().toISOString(),
+  };
+
+  const walletPayload = await buildWalletPayload(secret, pin, saltBytes);
+  const walletJson = JSON.stringify(walletPayload);
+  const verifierJson = JSON.stringify(verifierPayload);
+
+  const bundle: StoredWalletBundle = {
+    version: 1,
+    wallet: walletJson,
+    salt: saltHex,
+    verifier: verifierJson,
+    updatedAt: new Date().toISOString(),
+  };
+
+  // Write bundle to slot 0 and set active slot pointer to '0'
+  await SecureStore.setItemAsync(SLOT_0_KEY, JSON.stringify(bundle));
+  await SecureStore.setItemAsync(ACTIVE_SLOT_KEY, '0');
+
+  // Mirror to legacy keys for compatibility
+  await SecureStore.setItemAsync(WALLET_KEY, walletJson);
+  await SecureStore.setItemAsync(SALT_KEY, saltHex);
+  await SecureStore.setItemAsync(PIN_KEY, verifierJson);
+
+  // Clean up any other slots / pending keys
+  await Promise.all([
+    SecureStore.deleteItemAsync(SLOT_1_KEY),
+    SecureStore.deleteItemAsync(PENDING_SLOT_KEY),
+    SecureStore.deleteItemAsync(PENDING_WALLET_KEY),
+    SecureStore.deleteItemAsync(PENDING_SALT_KEY),
+    SecureStore.deleteItemAsync(PENDING_PIN_KEY),
+  ]);
+
+  cachedPinHash = pinHash;
+}
+
+async function storeSecret(secret: string, pin: string): Promise<void> {
+  await storeSecretWithSalt(secret, pin, await Crypto.getRandomBytesAsync(16), WALLET_KEY);
+}
+
+async function storeSecretWithSalt(secret: string, pin: string, salt: Uint8Array, keyName: string): Promise<void> {
+  const payload = await buildWalletPayload(secret, pin, salt);
   await SecureStore.setItemAsync(keyName, JSON.stringify(payload));
 }
 
@@ -624,20 +913,70 @@ async function maybeRewrapWalletSecret(
   const atCurrentVersion = (payload.kdfVersion ?? 1) === WALLET_KDF_VERSION;
   if (atCurrentCost && atCurrentVersion) return false;
 
-  await storeSecretWithSalt(secret, pin, await Crypto.getRandomBytesAsync(16), keyName);
+  const newSalt = await Crypto.getRandomBytesAsync(16);
+  const newPayload = await buildWalletPayload(secret, pin, newSalt);
+  const newJson = JSON.stringify(newPayload);
+
+  await SecureStore.setItemAsync(keyName, newJson);
+
+  // Keep both active slot and WALLET_KEY synchronized
+  if (keyName === WALLET_KEY) {
+    const activeSlot = await SecureStore.getItemAsync(ACTIVE_SLOT_KEY);
+    if (activeSlot === '0' || activeSlot === '1') {
+      const slotKey = activeSlot === '0' ? SLOT_0_KEY : SLOT_1_KEY;
+      const rawSlot = await SecureStore.getItemAsync(slotKey);
+      if (rawSlot) {
+        try {
+          const bundle = JSON.parse(rawSlot) as StoredWalletBundle;
+          bundle.wallet = newJson;
+          bundle.updatedAt = new Date().toISOString();
+          await SecureStore.setItemAsync(slotKey, JSON.stringify(bundle));
+        } catch {}
+      }
+    }
+  } else if (keyName === SLOT_0_KEY || keyName === SLOT_1_KEY) {
+    await SecureStore.setItemAsync(WALLET_KEY, newJson);
+  }
+
   return true;
 }
 
 async function readSecret(pin: string): Promise<string | null> {
+  await recoverPendingPinChange();
+
+  // 1. Try active slot first
+  const activeSlot = await SecureStore.getItemAsync(ACTIVE_SLOT_KEY);
+  if (activeSlot === '0' || activeSlot === '1') {
+    const slotKey = activeSlot === '0' ? SLOT_0_KEY : SLOT_1_KEY;
+    const rawBundle = await SecureStore.getItemAsync(slotKey);
+    if (rawBundle) {
+      try {
+        const bundle = JSON.parse(rawBundle) as StoredWalletBundle;
+        if (bundle.wallet) {
+          const secret = await decryptStoredWalletJson(pin, bundle.wallet, slotKey);
+          if (secret) return secret;
+        }
+      } catch {}
+    }
+  }
+
+  // 2. Fall back to WALLET_KEY or legacy PENDING_WALLET_KEY
   return (await readSecretAt(pin, WALLET_KEY)) || (await readSecretAt(pin, PENDING_WALLET_KEY));
 }
 
 async function readSecretAt(pin: string, keyName: string): Promise<string | null> {
   const stored = await SecureStore.getItemAsync(keyName);
   if (!stored) return null;
+  return decryptStoredWalletJson(pin, stored, keyName);
+}
 
+async function decryptStoredWalletJson(
+  pin: string,
+  storedWalletJson: string,
+  keyNameForRewrap: string,
+): Promise<string | null> {
   try {
-    const payload = JSON.parse(stored) as Partial<StoredWalletPayload>;
+    const payload = JSON.parse(storedWalletJson) as Partial<StoredWalletPayload>;
     if (
       payload.version !== WALLET_STORAGE_VERSION ||
       payload.cipher !== 'xchacha20-poly1305' ||
@@ -656,17 +995,12 @@ async function readSecretAt(pin: string, keyName: string): Promise<string | null
     const secret = bytesToUtf8(plaintext);
 
     if (StellarSdk.StrKey.isValidEd25519SecretSeed(secret)) {
-      // Issue #36 migration: a wallet wrapped at an older/weaker KDF cost is
-      // re-wrapped at the current one now that we hold the plaintext and a
-      // verified PIN. Best-effort and non-blocking — a failure here must never
-      // prevent an otherwise valid unlock, since the existing blob still works.
-      void maybeRewrapWalletSecret(secret, pin, payload, keyName).catch((error) => {
-        console.warn('Wallet KDF re-wrap failed; keeping existing blob:', error);
-      });
+      // Issue #36 migration: re-wrap if stored at older KDF cost
+      void maybeRewrapWalletSecret(secret, pin, payload, keyNameForRewrap).catch(() => {});
       return secret;
     }
   } catch (error) {
-    console.error('Wallet decrypt failed:', error);
+    Logger.error('Wallet decrypt failed:', error);
     return null;
   }
 
@@ -695,7 +1029,7 @@ async function storeBiometricBackup(
     await SecureStore.setItemAsync(BIOMETRIC_BACKUP_AVAILABLE_KEY, 'true');
     return true;
   } catch (error) {
-    console.warn('Biometric backup could not be stored:', error);
+    Logger.warn('Biometric backup could not be stored:', error);
     await SecureStore.deleteItemAsync(BIOMETRIC_BACKUP_AVAILABLE_KEY);
     return false;
   }
@@ -718,19 +1052,29 @@ export async function clearBiometricBackup(): Promise<void> {
 
 export async function clearWallet(): Promise<void> {
   try {
-    await SecureStore.deleteItemAsync(WALLET_KEY);
-    await SecureStore.deleteItemAsync(PENDING_WALLET_KEY);
-    await SecureStore.deleteItemAsync(SALT_KEY);
-    await SecureStore.deleteItemAsync(PENDING_SALT_KEY);
-    await SecureStore.deleteItemAsync(BIOMETRIC_BACKUP_KEY);
-    await SecureStore.deleteItemAsync(BIOMETRIC_BACKUP_AVAILABLE_KEY);
-    await SecureStore.deleteItemAsync(PIN_KEY);
-    await SecureStore.deleteItemAsync(PENDING_PIN_KEY);
-    await SecureStore.deleteItemAsync(PIN_ATTEMPTS_KEY);
+    // Resolve any half-committed change first so a wipe cannot destroy
+    // the only valid verifier during a pending state transition.
+    await recoverPendingPinChange();
+
+    await Promise.all([
+      SecureStore.deleteItemAsync(ACTIVE_SLOT_KEY),
+      SecureStore.deleteItemAsync(SLOT_0_KEY),
+      SecureStore.deleteItemAsync(SLOT_1_KEY),
+      SecureStore.deleteItemAsync(PENDING_SLOT_KEY),
+      SecureStore.deleteItemAsync(WALLET_KEY),
+      SecureStore.deleteItemAsync(PENDING_WALLET_KEY),
+      SecureStore.deleteItemAsync(SALT_KEY),
+      SecureStore.deleteItemAsync(PENDING_SALT_KEY),
+      SecureStore.deleteItemAsync(PIN_KEY),
+      SecureStore.deleteItemAsync(PENDING_PIN_KEY),
+      SecureStore.deleteItemAsync(BIOMETRIC_BACKUP_KEY),
+      SecureStore.deleteItemAsync(BIOMETRIC_BACKUP_AVAILABLE_KEY),
+      SecureStore.deleteItemAsync(PIN_ATTEMPTS_KEY),
+    ]);
     cachedPinHash = null;
     clearSessionPin();
   } catch (error) {
-    console.error('Error clearing wallet:', error);
+    Logger.error('Error clearing wallet:', error);
   }
 }
 
@@ -786,9 +1130,7 @@ export async function hasBiometricBackup(): Promise<boolean> {
 export async function recreateWalletFromSecret(secret: string, newPin: string): Promise<string> {
   if (!StellarSdk.StrKey.isValidEd25519SecretSeed(secret)) throw new Error('Invalid wallet backup');
   const wallet = createWalletObject(secret);
-  await storeSecret(secret, newPin);
-  await SecureStore.deleteItemAsync(SALT_KEY);
-  await storePinVerifier(newPin);
+  await persistWalletBundle(secret, newPin);
   cachePinForSession(newPin);
   cacheWalletForSession(secret);
   return wallet.publicKey;

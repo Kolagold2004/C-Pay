@@ -1,7 +1,7 @@
+import { Logger } from '../utils/logger';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { supabase } from './supabase';
 import EventEmitter from 'eventemitter3';
-import { generateCPayId } from '../utils/cpayId';
 import { getNetworkConfig, isValidTransactionHash, isValidAccountId } from './blockchain';
 
 // Event emitter for real-time updates
@@ -22,10 +22,7 @@ export interface Transaction {
   // Phase 2: Invisible Rail - Two-tier status system
   internal_status?: 'processing' | 'submitted' | 'confirmed' | 'failed';
   user_visible_status?: 'success' | 'failed';
-  // Transaction type: personal (P2P) or merchant (business payment)
-  transaction_type?: 'personal' | 'merchant';
-  merchant_id?: string; // Reference to merchant if transaction_type is 'merchant'
-  merchant_name?: string; // Business name (for backward compatibility)
+  transaction_type?: 'personal';
   note?: string; // Optional payment note
   sender_name?: string; // Name of the person who sent the payment
   recipient_name?: string; // Name of recipient (person or business)
@@ -37,11 +34,6 @@ export interface Transaction {
 
 // Hybrid storage: Local (AsyncStorage) + Cloud (Supabase)
 // Works offline, syncs when online
-
-async function getCurrentAuthUserId(): Promise<string | null> {
-  const { data } = await supabase.auth.getSession();
-  return data.session?.user.id || null;
-}
 
 // Helper function to get user's display name from Supabase by wallet address
 export async function getUserDisplayName(walletAddress: string): Promise<string | null> {
@@ -55,53 +47,7 @@ export async function getUserDisplayName(walletAddress: string): Promise<string 
     }
     return null;
   } catch (error) {
-    console.log('Error fetching user display name:', error);
-    return null;
-  }
-}
-
-// Helper function to get or create user in Supabase
-async function getOrCreateUser(walletAddress: string, phoneNumber?: string, displayName?: string): Promise<string | null> {
-  try {
-    const authUserId = await getCurrentAuthUserId();
-
-    // Check if user exists
-    const { data: existingUser, error: fetchError } = await supabase
-      .from('users')
-      .select('id')
-      .eq('wallet_address', walletAddress)
-      .maybeSingle();
-
-    if (existingUser && !fetchError) {
-      return existingUser.id;
-    }
-
-    // Create new user
-    const verifiedEmail = await AsyncStorage.getItem('user_email');
-    const cpayId = walletAddress ? generateCPayId(verifiedEmail || phoneNumber || '', walletAddress) : null;
-
-    const { data: newUser, error: insertError } = await supabase
-      .from('users')
-      .insert({
-        auth_user_id: authUserId,
-        wallet_address: walletAddress,
-        email: verifiedEmail || null,
-        phone_number: phoneNumber || null,
-        display_name: displayName || null,
-        cpay_id: cpayId, // Save C-Pay ID to database
-      })
-      .select('id')
-      .single();
-
-    if (newUser && !insertError) {
-      console.log('✅ User created in Supabase:', newUser.id);
-      return newUser.id;
-    }
-
-    console.log('Error creating user:', insertError?.message);
-    return null;
-  } catch (error) {
-    console.log('Error in getOrCreateUser:', error);
+    Logger.info('Error fetching user display name:', error);
     return null;
   }
 }
@@ -138,13 +84,9 @@ export async function saveTransaction(tx: Transaction): Promise<void> {
 
     await AsyncStorage.setItem('transactions', JSON.stringify(nextTxs));
 
-    console.log('✅ Transaction saved locally:', txWithTime.tx_hash);
-
     // Emit event for real-time UI updates
     storageEvents.emit('transactionSaved', txWithTime);
-    console.log('📡 Emitted transactionSaved event');
   } catch (error) {
-    console.error('Error saving transaction:', error);
     throw error;
   }
 }
@@ -155,15 +97,13 @@ export async function getTransactions(): Promise<Transaction[]> {
     const local = await AsyncStorage.getItem('transactions');
     const rawLocalTxs = local ? JSON.parse(local) : [];
     const localTxs = rawLocalTxs.filter((tx: Transaction) => isValidTransactionHash(tx.tx_hash));
-    
-    console.log(`📦 Loaded ${localTxs.length} transactions from local storage`);
 
     // Sync with Supabase in background (read-only trusted receipts)
     try {
       const walletAddress = await AsyncStorage.getItem('wallet_address');
       
       if (!walletAddress) {
-        console.log('No wallet address found, using local data only');
+        Logger.info('No wallet address found, using local data only');
         return localTxs;
       }
 
@@ -174,7 +114,6 @@ export async function getTransactions(): Promise<Transaction[]> {
       // isValidAccountId uses the Stellar SDK's Ed25519 public-key checker,
       // which rejects anything that isn't a well-formed G-account address.
       if (!isValidAccountId(walletAddress)) {
-        console.warn('Skipping Supabase fetch: wallet address failed validation', walletAddress);
         return localTxs;
       }
 
@@ -190,7 +129,6 @@ export async function getTransactions(): Promise<Transaction[]> {
 
       if (data && !error && data.length > 0) {
         const chainTxs = data.filter((tx: Transaction) => isValidTransactionHash(tx.tx_hash));
-        console.log(`☁️ Loaded ${chainTxs.length} transactions from Supabase`);
 
         // Merge local and cloud data (remove duplicates by tx_hash)
         const mergedTxs = [...chainTxs];
@@ -210,13 +148,12 @@ export async function getTransactions(): Promise<Transaction[]> {
         return mergedTxs;
       }
     } catch (supabaseError) {
-      console.log('Supabase fetch skipped (using local data):', supabaseError);
+      Logger.info('Supabase fetch skipped (using local data):', (supabaseError as any)?.code || (supabaseError as any)?.name || 'Error');
     }
 
     // Return local data
     return localTxs;
   } catch (error) {
-    console.error('Error getting transactions:', error);
     return [];
   }
 }
@@ -252,6 +189,5 @@ export async function updateTransactionStatus(
       await AsyncStorage.setItem('transactions', JSON.stringify(updated));
     }
   } catch (error) {
-    console.error('Error updating transaction status:', error);
   }
 }
