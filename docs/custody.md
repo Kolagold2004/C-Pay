@@ -1,20 +1,26 @@
-# C-Pay Key Custody & Key Management Plan
+# Key custody
 
-> **Classification:** Confidential / Security Architecture  
-> **Status:** Production-Ready (Phase 2 Deliverable — Issue #58)  
-> **Scope:** Stellar Relayer Sponsor, Distribution, Asset Issuer, and Contract Admin Keys
+C-Pay does not issue or custody the USDC asset. Circle controls the USDC issuer; C-Pay must never store an issuer secret or expose minting code.
+
+## Keys operated by C-Pay
+
+| Account | Purpose | Recommended control |
+| --- | --- | --- |
+| Sponsor | Creates accounts and pays sponsored reserves and fees | Isolated secret store, least-privilege service access, rotation runbook |
+| Distribution | Holds testnet USDC used for pilot distribution | Separate secret store, low-balance monitoring, strict inventory limits |
+| User | Signs user payments | Encrypted user-controlled wallet backup; never sent to the relayer |
+
+Production money-in must come from a licensed on-ramp partner. The distribution account is a testnet-only pilot mechanism, not an issuer or fiat reserve.
 
 ---
 
-## 1. Executive Summary & Threat Model
-
-The C-Pay relayer functions as a non-custodial transaction sponsor and on-demand liquidity distributor. In production environments, holding raw secret keys in plaintext `.env` files on a single host poses severe security risks:
+## 1. Threat Model & Key Custody Challenges
 
 1. **Host Compromise / Server Breach**: Exfiltration of `.env` leads to total loss of sponsor funds and distribution liquidity.
 2. **Insider Threat & Operator Mistake**: Accidental logging, accidental commits, or shared credentials.
 3. **Single Point of Failure (SPOF)**: Inability to rotate compromised keys without downtime.
 
-To eliminate raw secret storage and mitigate key drainage attacks, C-Pay enforces a **tiered least-privilege key architecture** backed by **Cloud KMS / HSM** and **Stellar Multi-Signature (Multisig)**.
+To eliminate raw secret exposure in application logic and mitigate key drainage attacks, C-Pay enforces a **tiered least-privilege key architecture** managed by the **`KeyManager`** custody abstraction and backed by **Stellar Multi-Signature (Multisig)**.
 
 ---
 
@@ -32,18 +38,22 @@ Every key in the C-Pay ecosystem has a distinct role, security tier, and authori
 
 ---
 
-## 3. Storage & Signing Architecture (Zero Plaintext Secrets)
+## 3. Storage & Signing Architecture
 
-### 3.1 Eliminating Raw Secret Keys in Deployed Environments
-In all non-local deployed environments (Staging, Pre-Prod, Mainnet):
-- **No `SPONSOR_SECRET` or `DISTRIBUTION_SECRET` plaintext values exist in `.env` or container filesystems.**
-- Relayer processes authenticate using **IAM Instance Roles** (AWS IAM / GCP Workload Identity / Vault AppRole).
-- Signing operations call the `KeyManager` interface (`relayer-service/keyManager.js`), which submits the transaction hash to KMS / HSM to receive the signature.
+### 3.1 Pre-Mainnet / Testnet Pilot Posture (Current Implementation)
+In the current testnet pilot deployment:
+- **Consolidated Signing Path**: All transaction and fee-bump signing in the relayer service (`/accounts/prepare`, `/payments/submit`, `/accounts/claim-distribution-balance`) is routed strictly through the `KeyManager` abstraction (`relayer-service/keyManager.js`).
+- **Encapsulated Secrets**: Route handlers and transaction builders never access raw secret keys. Keys are loaded into `KeyManager` upon startup using its `local-keypair` driver (`SIGNER_PROVIDER=env`).
+- **Signing Velocity & Anomaly Monitoring**: `KeyManager` audits signing activity and triggers alerts if signing velocity exceeds threshold (`MAX_SIGNS_PER_MINUTE`).
+- **Defensible Pilot Posture**: Testnet operation with environment-injected secrets managed through a single custody interface is an acceptable pre-mainnet pilot posture.
 
-### 3.2 Key Management Service (KMS) Setup
-- **AWS KMS Key Spec**: `ECC_NIST_ED25519` (Stellar Ed25519 Curve25519 signing).
-- **Key Policy**: Restricted strictly to the Relayer Execution Role ARN (`arn:aws:iam::...:role/cpay-relayer-signer`).
-- **CloudTrail Auditing**: Every `kms:Sign` request logs the transaction hash, caller identity, IP, and timestamp.
+### 3.2 Mainnet Launch Gate: Cloud KMS / HSM Integration (Outstanding)
+Prior to public mainnet launch:
+- **Zero Plaintext Secrets**: The `local-keypair` driver will be replaced by a production Cloud KMS / HSM driver (AWS KMS `ECC_NIST_ED25519` / GCP Cloud KMS / HashiCorp Vault). No raw secret keys (`SPONSOR_SECRET`, `DISTRIBUTION_SECRET`) may exist in environment variables, configuration files, or container filesystems.
+- **IAM Instance Roles**: Relayer processes authenticate to KMS using IAM instance roles or Workload Identity without static credentials.
+- **Hardware-Backed Ed25519 Signing**: The KMS signs the 32-byte transaction hash directly using asymmetric keys whose private seeds never leave hardware security boundaries.
+- **CloudTrail Audit Logging**: Every `kms:Sign` request logs caller identity, IP, transaction hash, and timestamp.
+- **Mainnet Gate Status**: ⏳ **Outstanding**. The production KMS driver is tracked as a blocking gate before mainnet release. Placeholder stubs have been removed in favor of explicit configuration checks.
 
 ---
 
@@ -145,20 +155,29 @@ await server.submitTransaction(removeOldSignerTx);
 
 ---
 
-## 6. Testnet Rehearsal Log & Validation Results
+## 6. Key Rotation Rehearsal Status
 
-* **Date Executed:** August 31, 2026
-* **Network:** Stellar Testnet
-* **Target Account:** `GBGJS2UIEF2DYN3L67P2A7X62M4WK72JGTF7ABCOQL75UYHMWYLFRI4S`
-* **Test Sequence:**
-  1. Set up initial keypair `K1` with weight 1.
-  2. Prepared and submitted Add Money claims using `K1` (Success).
-  3. Added second keypair `K2` via `setOptions` with weight 1. Both `K1` and `K2` valid.
-  4. Rotated Relayer `KeyManager` active signer from `K1` to `K2`.
-  5. Successfully processed `/accounts/prepare` and `/payments/submit` using `K2`.
-  6. Set `K1` weight to 0.
-  7. Attempted transaction signed by `K1` only -> Horizon rejected with `tx_bad_auth` (Signer successfully revoked).
-  8. Transactions signed by `K2` succeeded with 0 downtime.
+> [!IMPORTANT]
+> **Status: Tracked as Outstanding Mainnet Gate**
+> While the rotation procedure is fully specified in Section 5 and runtime rotation is supported by `KeyManager.rotateKey()`, an end-to-end multi-operator rehearsal under live testnet traffic is **tracked as an outstanding operational deliverable** prior to mainnet launch.
+
+### 6.1 Rehearsal Protocol & Checklist (Owed Prior to Mainnet)
+To sign off on the rehearsal gate prior to mainnet deployment, the operations team will perform and record the following drill on Stellar Testnet:
+1. **Pre-flight verification**: Query Horizon for current signer weights and thresholds on the sponsor and distribution accounts.
+2. **Add secondary signer**: Submit a `setOptions` transaction adding secondary signer `K2` with weight = 1:
+   ```javascript
+   const tx = new StellarSdk.TransactionBuilder(account, { fee: 100, networkPassphrase })
+     .addOperation(StellarSdk.Operation.setOptions({
+       signer: { ed25519PublicKey: G_NEW_KEY, weight: 1 },
+     }))
+     .setTimeout(60)
+     .build();
+   ```
+3. **Hot-rotate active signer in Relayer**: Invoke `keyManager.rotateKey(role, newSecretOrKmsUri)` without restarting the relayer.
+4. **Traffic verification**: Verify new transactions (`/accounts/prepare`, `/payments/submit`) are signed by `G_NEW_KEY` and succeed on Horizon.
+5. **Revoke primary signer**: Submit a `setOptions` transaction setting `G_OLD_KEY` weight to 0.
+6. **Negative authentication test**: Confirm transactions attempting to use revoked key `G_OLD_KEY` fail with `tx_bad_auth`.
+7. **Sign-off log**: Record execution date, network ledger sequence numbers, transaction hashes, and operator sign-offs in this runbook.
 
 ---
 
@@ -172,7 +191,7 @@ await server.submitTransaction(removeOldSignerTx);
 ### 7.2 Anomaly & Velocity Detection
 - **Signing Velocity Threshold**: Triggered if `KeyManager` exceeds 120 signatures/minute (`MAX_SIGNS_PER_MINUTE`).
 - **Unexpected Source Account Check**: Relayer enforces `requireWalletOwnership()` on every request to prevent signing for unauthorized accounts.
-- **Circuit Breaker**: If unauthorized signing velocity is detected, the relayer automatically sets `ENABLE_ADD_MONEY=false` and notifies operators.
+- **Circuit Breaker**: Keep the legacy testnet faucet disabled (`ENABLE_TESTNET_FAUCET=false`) and revoke the distribution key if unauthorized signing is detected.
 
 ---
 
@@ -180,9 +199,12 @@ await server.submitTransaction(removeOldSignerTx);
 
 | Requirement | Implementation | Status |
 | :--- | :--- | :--- |
-| **Written Custody Plan** | [docs/custody.md](file:///d:/Coding/C-Pay/docs/custody.md) detailing inventory, storage, rotation, alerting | ✅ Complete |
-| **No Raw Secrets in Deployed Environments** | `KeyManager` KMS/Vault provider abstraction in `relayer-service/keyManager.js` | ✅ Complete |
+| **Written Custody Plan** | [docs/custody.md](file:///d:/Coding%20Only/OpenSource/saurav/C-Pay/docs/custody.md) detailing inventory, storage, rotation, and alerting | ✅ Complete |
+| **Unified Signing Path** | All relayer transaction signing routed exclusively through `KeyManager` (`relayer-service/keyManager.js`) | ✅ Complete |
+| **Pre-Mainnet Pilot Custody Posture** | Testnet uses local-keypair driver in `KeyManager` with env secrets; route handlers have zero raw secret access | ✅ Complete |
+| **No Raw Secrets in Production (Cloud KMS / HSM)** | AWS KMS / Vault driver integration in `KeyManager` | ⏳ Outstanding Mainnet Gate |
 | **Least Privilege & Role Separation** | Strict separation between Issuer, Sponsor, and Distribution keys | ✅ Complete |
-| **Multi-Signature Policy** | M-of-N multisig policies for funds and issuer controls documented | ✅ Complete |
-| **Rotation Runbook & Rehearsal** | Zero-downtime rotation protocol documented and verified on testnet | ✅ Complete |
-| **Balance & Activity Alarms** | Automated balance drop & velocity alert dispatching in place | ✅ Complete |
+| **Multi-Signature Policy** | M-of-N multisig policies for funds and issuer controls documented | ⏳ Planned for Mainnet |
+| **Rotation Runbook** | Zero-downtime rotation protocol documented in Section 5 | ✅ Complete |
+| **Live Testnet Rotation Rehearsal** | Multi-operator rehearsal under live traffic | ⏳ Outstanding Mainnet Gate |
+| **Balance & Activity Alarms** | KeyManager velocity tracking and server balance monitoring alerts | ✅ Complete |
